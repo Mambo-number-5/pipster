@@ -1,0 +1,15 @@
+# Core
+pandas
+numpy
+ccxt
+
+# Tooling & Debug
+python-dotenv
+debugpy
+ipython
+
+# Grafici (per il backtest)
+matplotlib
+
+# Database (opzionale, ma consigliato)
+redis

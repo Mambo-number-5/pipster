@@ -1,0 +1,6 @@
+**Come usare il bot Pipster**:
+
+   1. Modifica il file .env per impostare il tuo capitale e il simbolo (es. ETH/USDT).
+   2. Se vuoi cambiare la strategia, non toccare main.py, guarda indicators.py.
+   3. Clicca su avvia_bot.bat (Windows) o ./avvia_bot.sh (Mac).
+   4. Al termine, troverai un file report_backtest.png con i risultati del bot.

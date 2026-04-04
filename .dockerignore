@@ -1,0 +1,23 @@
+# Configurazione Editor e IDE
+.vscode/
+.idea/
+
+# Credenziali (FONDAMENTALE: non devono finire nell'immagine)
+.env
+*.yml
+*.yaml
+secrets/
+
+# Ambiente Python e Cache
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.dockerignore
+venv/
+.env/
+
+# Documentazione e file inutili al bot
+README.md
+docs/
+tests/

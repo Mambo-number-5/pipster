@@ -1,0 +1,24 @@
+# Credenziali (FONDAMENTALE: mai caricarle su Git)
+.env
+*.yml
+*.yaml
+!docker-compose.yml  # Eccezione: il compose va caricato, ma senza chiavi dentro
+docker-compose.override.yml # Non carico il servizio dove si ferma in modalità debugger per semplicità di uso
+# Configurazione Editor
+.vscode/
+.idea/
+
+# Python e Dipendenze
+__pycache__/
+*.pyc
+venv/
+.env/
+*.egg-info/
+dist/
+build/
+
+# Dati e Log (per il backtest)
+*.log
+*.db
+*.csv
+plots/
