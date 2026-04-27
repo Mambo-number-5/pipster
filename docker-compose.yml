@@ -1,0 +1,33 @@
+services:
+  # Servizio Database In-Memory
+  redis:
+    image: redis:7-alpine
+    container_name: pipster_redis
+    command: redis-server --save 60 1 --loglevel warning
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Il nostro Bot
+  bot:
+    build: .
+    image: pipster
+    container_name: pipster_bot
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+      - ./reports:/app/reports
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    # Comando standard: avvia il bot normalmente
+    command: python main.py
+    restart: unless-stopped
+
+volumes:
+  redis_data:
