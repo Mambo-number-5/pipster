@@ -21,3 +21,5 @@ venv/
 README.md
 docs/
 tests/
+reports/
+plots/

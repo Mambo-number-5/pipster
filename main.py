@@ -17,7 +17,15 @@ DAYS_BACK = int(os.getenv("DAYS_BACK", 93))
 TIMEFRAMES = os.getenv("TIMEFRAMES", "15m").split(",")
 
 # Dizionario parametri (potresti anche metterlo in un file JSON esterno)
-from config_params import TIMEFRAME_PARAMS 
+# from config_params import TIMEFRAME_PARAMS 
+# config_params.py
+TIMEFRAME_PARAMS = {
+    "15m": {"SL_MULTIPLIER": 1.5, "TP_MULTIPLIER": 2.0},
+    "1h":  {"SL_MULTIPLIER": 2.0, "TP_MULTIPLIER": 3.0},
+    "4h":  {"SL_MULTIPLIER": 2.5, "TP_MULTIPLIER": 4.0}
+}
+
+
 
 # =========================================================
 # DOWNLOAD DATI
@@ -90,6 +98,26 @@ def main():
         final_report["Capital"].plot()
         plt.savefig("report_backtest.png")
         print("📈 Grafico salvato in report_backtest.png")
+        # --- NUOVO: COLLEGAMENTO AL MONTE CARLO ---
+        print("\n🎲 Avvio Analisi Monte Carlo sui trade reali...")
+
+        
+        # Importa il modulo che abbiamo creato l'altra volta
+        from monte_carlo_analysis import block_bootstrap_mc, calculate_mc_stats, plot_mc_results
+        
+        # Assicurati che final_report abbia una colonna con il profitto/perdita del singolo trade
+        # Se hai solo il 'Capital', puoi calcolare il PnL così:
+        trade_pnl = final_report['Capital'].diff().dropna().values
+        
+        # Esegui la simulazione
+        sims = block_bootstrap_mc(trade_pnl, block_size=5, iterations=1000, initial_capital=INITIAL_CAPITAL)
+        stats = calculate_mc_stats(sims, INITIAL_CAPITAL)
+        
+        print(f"Probabilità di chiudere in perdita: {stats['prob_loss']:.2%}")
+        print(f"Peggior Drawdown (95° pct): {stats['max_drawdown_95pct']:.2%}")
+        
+        # Salva il grafico
+        plot_mc_results(sims, original_equity=final_report['Capital'].values)
     else:
         print("❌ Nessun trade eseguito.")
 
