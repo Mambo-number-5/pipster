@@ -9,6 +9,7 @@
 secrets/
 
 # Ambiente Python e Cache
+tests/__pycache__/
 __pycache__/
 *.pyc
 .git/

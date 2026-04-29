@@ -21,4 +21,4 @@ EXPOSE 5678
 
 # Il comando CMD della Versione 2 è perfetto per il debug:
 # --wait-for-client blocca l'esecuzione finché non premi F5 su VS Code
-CMD ["python", "-m", "debugpy", "--listen", "0.0.0.0:5678", "--wait-for-client", "main.py"]
+CMD ["python", "main.py"]

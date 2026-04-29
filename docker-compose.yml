@@ -1,5 +1,10 @@
 services:
   # Servizio Database In-Memory
+  # Se il bot gira in un sistema operativo Linux la prima volta che si avvia, usare:
+  # sudo sysctl vm.overcommit_memory=1 && echo 'vm.overcommit_memory = 1' | sudo tee -a /etc/sysctl.conf
+  # Questa impostazione Kernel sulla macchina che ospita i container serve a non fermare Redis 
+  # in caso di lavoro intenso.
+  # i.e. cautelativamente redis chiede troppa RAM e il kernel lo ferma, però è molto improbabile redis la usi tutta
   redis:
     image: redis:7-alpine
     container_name: pipster_redis

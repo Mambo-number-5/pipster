@@ -10,6 +10,7 @@ docker-compose.override.yml # Non carico il servizio dove si ferma in modalità 
 
 # Python e Dipendenze
 __pycache__/
+tests/__pycache__/
 *.pyc
 venv/
 .env/

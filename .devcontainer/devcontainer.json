@@ -1,0 +1,35 @@
+{
+    "name": "Pipster Bot - Dev Environment",
+    // Puntiamo ai tuoi file compose esistenti
+    "dockerComposeFile": [
+        "../docker-compose.yml",
+        "../docker-compose.override.yml"
+    ],
+    // Diciamo a VS Code di entrare nel servizio "bot"
+    "service": "bot",
+    "workspaceFolder": "/app",
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",              // Supporto Python
+                "ms-python.vscode-pylance",      // Suggerimenti intelligenti (risolve le linee rosse)
+                "njpwerner.autodocstring",       // Per documentare la statistica velocemente
+                "ms-azuretools.vscode-docker",   // Gestione container da VS Code
+                "redhat.vscode-yaml"             // Autocompletamento per i file .yml
+            ],
+            "settings": {
+                // Usa il Python del container, dove CCXT e Redis sono già installati
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "python.analysis.typeCheckingMode": "basic",
+                "editor.formatOnSave": true
+            }
+        }
+    },
+
+    // Una volta creato il container, installa le dipendenze se mancano
+    "postCreateCommand": "pip install -r requirements.txt",
+
+    // Permette al debugger di connettersi internamente
+    "remoteUser": "root"
+}
