@@ -1,21 +1,15 @@
 services:
-  # Servizio Database In-Memory
-  # Se il bot gira in un sistema operativo Linux la prima volta che si avvia, usare:
-  # sudo sysctl vm.overcommit_memory=1 && echo 'vm.overcommit_memory = 1' | sudo tee -a /etc/sysctl.conf
-  # Questa impostazione Kernel sulla macchina che ospita i container serve a non fermare Redis 
-  # in caso di lavoro intenso.
-  # i.e. cautelativamente redis chiede troppa RAM e il kernel lo ferma, però è molto improbabile redis la usi tutta
   redis:
-    image: redis:7-alpine
+    # Cambiamo l'immagine per includere i moduli RedisJSON e RedisSearch
+    image: redis/redis-stack-server:latest
     container_name: pipster_redis
-    command: redis-server --save 60 1 --loglevel warning
+    #command: redis-server --save 60 1 --loglevel warning
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
 
-  # Il nostro Bot
   bot:
     build: .
     image: pipster
@@ -25,11 +19,17 @@ services:
     volumes:
       - .:/app
       - ./reports:/app/reports
+      # Aggiungiamo il volume per i dati storici (Parquet)
+      - ./historical_data:/app/historical_data
     env_file:
       - .env
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - PYDEVD_DISABLE_FILE_VALIDATION=1  # Toglie il warning del debugger
+      - PYTHONUNBUFFERED=1               # Log in tempo reale (fondamentale), ora vedi i print mano a mano che compaiono
+    # Se vuoi togliere anche il warning su "frozen modules", 
+    # dovresti aggiungere -Xfrozen_modules=off al comando python
     # Comando standard: avvia il bot normalmente
     command: python main.py
     restart: unless-stopped

@@ -3,110 +3,102 @@ import time
 import os
 import sys
 
-# Aggiungiamo la cartella principale al path per importare RedisClient
+# Forza l'uso del DB 15 per i test prima ancora di importare o istanziare il client
+os.environ["REDIS_DB"] = "15"
+
+# Aggiungiamo la cartella principale al path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from redis_client import RedisClient
 
-class TestRedisClient(unittest.TestCase):
+class TestRedisProfessional(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Inizializza il client prima di tutti i test"""
+        """Inizializza il client una sola volta per la suite di test"""
         cls.db = RedisClient()
+        # Verifica di sicurezza: non vogliamo piallare il DB di produzione (solitamente lo 0)
+        if cls.db.client.connection_pool.connection_kwargs['db'] != 15:
+            raise RuntimeError("ERRORE: Il test sta puntando a un database diverso dal 15!")
 
-    def test_01_set_get(self):
-        """Testa il salvataggio e recupero di dati semplici e complessi"""
-        print("\n[TEST] Verifica Getter/Setter...")
-        # Stringa
-        self.db.set_value("test_key", "ciao")
-        self.assertEqual(self.db.get_value("test_key"), "ciao")
-        
-        # Dizionario (JSON)
-        data = {"id": 1, "status": "active"}
-        self.db.set_value("test_dict", data)
-        self.assertEqual(self.db.get_value("test_dict"), data)
+    def setUp(self):
+        """Eseguito PRIMA di ogni singolo test: pulizia totale del DB 15"""
+        self.db.client.flushdb()
 
-    def test_02_pubsub_background(self):
-        """Testa il sistema di segnali in background (emergenze)"""
-        print("\n[TEST] Verifica Pub/Sub in Background...")
+    def test_01_json_native_logic(self):
+        """Verifica il cuore di RedisJSON: salvataggio, recupero e append"""
+        print("\n[TEST] Verifica Logica RedisJSON (Hot Data)...")
         
-        ricevuto = []
-        def mia_callback(msg):
-            ricevuto.append(msg)
+        key = "ticker:BTCUSD"
+        data = {"symbol": "BTCUSD", "price": 65000, "active": True}
+        
+        self.db.set_json(key, data)
+        res = self.db.get_json(key)
+        
+        # NOTA: Se hai usato il mio wrapper rifattorizzato, 'res' è già il dizionario.
+        # Se usi il tuo vecchio codice, devi mantenere res[0].
+        # Assumendo il wrapper 'clean':
+        self.assertEqual(res["symbol"], "BTCUSD")
+        
+        history_key = "history:BTCUSD:1m"
+        candela_1 = {"t": 1714400000, "o": 65000, "c": 65100}
+        candela_2 = {"t": 1714400060, "o": 65100, "c": 65050}
+        
+        self.db.append_to_list(history_key, candela_1)
+        self.db.append_to_list(history_key, candela_2)
+        
+        history = self.db.get_json(history_key)
+        # Con wrapper clean, history è direttamente la lista:
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[1]["c"], 65050)
+        print("   -> RedisJSON gestisce correttamente gli array di candele.")
 
-        # Avvio ascolto
-        canale = "test_channel"
-        killer = self.db.subscribe_in_background(canale, mia_callback)
+    def test_02_multithreading_pubsub(self):
+        """Verifica che i segnali in background non interferiscano con la logica JSON"""
+        print("\n[TEST] Verifica Multithreading e Segnali...")
         
-        # Aspettiamo che il thread sia attivo
+        messaggi_ricevuti = []
+        def callback(msg):
+            messaggi_ricevuti.append(msg)
+
+        stop_event = self.db.subscribe_in_background("ALERTS", callback)
         time.sleep(0.5)
         
-        # Pubblichiamo un messaggio
-        test_msg = {"alert": "LIQUIDAZIONE", "valore": 100}
-        self.db.publish_event(canale, test_msg)
+        alert_msg = {"type": "MARGIN_CALL", "level": "HIGH"}
+        self.db.publish_event("ALERTS", alert_msg)
         
-        # Diamo tempo al thread di processare
         time.sleep(1)
+        self.assertIn(alert_msg, messaggi_ricevuti)
         
-        self.assertIn(test_msg, ricevuto)
-        print(f"   -> Messaggio ricevuto correttamente: {ricevuto[0]}")
+        stop_event.set()
+        print(f"   -> Thread di background isolato e funzionante.")
+
+    def test_03_stress_async_flow(self):
+        """Test di stress: scriviamo JSON mentre ascoltiamo canali"""
+        print("\n[TEST] Verifica Stress Mix (JSON + PubSub)...")
         
-        # Fermiamo il thread
-        killer.set()
-        time.sleep(0.5)
+        counter = {"count": 0}
+        def fast_callback(msg):
+            counter["count"] += 1
+
+        self.db.subscribe_in_background("FEED", fast_callback)
+        
+        # Inondiamo Redis di piccoli aggiornamenti JSON
+        for i in range(10):
+            self.db.set_json(f"thread_test:{i}", {"val": i})
+            self.db.publish_event("FEED", {"update": i})
+        
+        # Un piccolo respiro per permettere ai thread di processare i 10 messaggi
+        time.sleep(1.5)
+        self.assertEqual(counter["count"], 10)
+        self.assertEqual(self.db.get_json("thread_test:9")["val"], 9)
+        
+        self.db.stop_all_subscriptions()
+        print("   -> Stress test superato: nessuna collisione tra thread.")
     
-    def test_03_multi_channel_management(self):
-        """Testa la gestione di più canali contemporaneamente e la chiusura selettiva"""
-        print("\n[TEST] Verifica Multi-Canale e Tracciabilità...")
-        
-        ricevuti = {"BTC": [], "ETH": [], "SOL": []}
-        
-        # Definiamo una callback generica che usa il canale per smistare i dati
-        def callback_multi(msg):
-            # Assumiamo che il messaggio contenga il simbolo
-            simbolo = msg.get("simbolo")
-            if simbolo in ricevuti:
-                ricevuti[simbolo].append(msg)
-
-        # 1. Avvio dei 3 thread
-        stop_btc = self.db.subscribe_in_background("BTC_CHANNEL", callback_multi)
-        stop_eth = self.db.subscribe_in_background("ETH_CHANNEL", callback_multi)
-        stop_sol = self.db.subscribe_in_background("SOL_CHANNEL", callback_multi)
-
-        time.sleep(0.5) # Tempo tecnico di attivazione
-
-        # 2. Pubblicazione messaggi mirati
-        self.db.publish_event("BTC_CHANNEL", {"simbolo": "BTC", "prezzo": 60000})
-        self.db.publish_event("ETH_CHANNEL", {"simbolo": "ETH", "prezzo": 3000})
-        self.db.publish_event("SOL_CHANNEL", {"simbolo": "SOL", "prezzo": 150})
-
-        time.sleep(1) # Attesa elaborazione
-
-        # 3. Verifico se tutti e 3 i simboli hanno ricevuto un messaggio
-        self.assertEqual(len(ricevuti["BTC"]), 1)
-        self.assertEqual(len(ricevuti["ETH"]), 1)
-        self.assertEqual(len(ricevuti["SOL"]), 1)
-        print("   -> Tutti i canali hanno ricevuto il proprio messaggio.")
-
-        # 4. Chiusura selettiva (fermiamo solo ETH)
-        stop_eth.set()
-        time.sleep(0.5)
-        
-        # Proviamo a inviare di nuovo a tutti
-        self.db.publish_event("BTC_CHANNEL", {"simbolo": "BTC", "prezzo": 61000})
-        self.db.publish_event("ETH_CHANNEL", {"simbolo": "ETH", "prezzo": 3100})
-        
-        time.sleep(1)
-
-        # BTC deve avere 2 messaggi, ETH deve essere rimasto a 1
-        self.assertEqual(len(ricevuti["BTC"]), 2)
-        self.assertEqual(len(ricevuti["ETH"]), 1)
-        print("   -> Chiusura selettiva riuscita: BTC continua, ETH è fermo.")
-
-        # Pulizia finale
-        stop_btc.set()
-        stop_sol.set()
+    def tearDown(self):
+        """Eseguito DOPO ogni singolo test: ferma le sottoscrizioni per evitare leak di thread"""
+        self.db.stop_all_subscriptions()
 
 if __name__ == '__main__':
     unittest.main()

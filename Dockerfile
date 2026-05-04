@@ -11,6 +11,7 @@ WORKDIR /app
 
 # Sfruttiamo la cache di Docker per le dipendenze
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia il resto del progetto
@@ -19,6 +20,7 @@ COPY . .
 # Espone la porta del debugger
 EXPOSE 5678
 
-# Il comando CMD della Versione 2 è perfetto per il debug:
+# Il comando CMD della Versione 2 è perfetto per il debug, però qui siamo in produzione ed è meglio una semplice chiamata al main
+# per il debug inserire in un file docker-compose.override.yml la vecchia versione per lanciare:
 # --wait-for-client blocca l'esecuzione finché non premi F5 su VS Code
 CMD ["python", "main.py"]
