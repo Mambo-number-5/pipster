@@ -95,7 +95,28 @@ class TestRedisProfessional(unittest.TestCase):
         
         self.db.stop_all_subscriptions()
         print("   -> Stress test superato: nessuna collisione tra thread.")
-    
+
+    def test_04_stream_persistence(self):
+        """Verifica che lo stream mantenga la cronologia degli eventi"""
+        print("\n[TEST] Verifica Redis Streams (Audit Log)...")
+        
+        stream_key = "test_log_stream"
+        event = {"module": "STRATEGY", "msg": "Incrocio medie rilevato"}
+        
+        # Scrittura
+        entry_id = self.db.log_event(stream_key, event)
+        self.assertIsNotNone(entry_id)
+        
+        # Lettura
+        recent = self.db.get_recent_events(stream_key, count=1)
+        if not isinstance(recent, list):
+            raise TypeError("Errore nel caricamento, la risposta non è una lista")
+        self.assertEqual(len(recent), 1)
+        
+        # La struttura di ritorno di Redis è: (id, {dizionario})
+        self.assertEqual(recent[0][1]["module"], "STRATEGY")
+        print(f"   -> Evento loggato con ID: {entry_id}")
+
     def tearDown(self):
         """Eseguito DOPO ogni singolo test: ferma le sottoscrizioni per evitare leak di thread"""
         self.db.stop_all_subscriptions()

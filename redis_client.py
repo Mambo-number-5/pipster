@@ -3,6 +3,7 @@ import os
 import threading
 import json
 from typing import Any, Optional, Callable
+from redis.typing import ResponseT
 
 class RedisClient:
     """
@@ -101,7 +102,7 @@ class RedisClient:
             if not self.client.exists(key):
                 self.set_json(key, [])
             result = self.client.json().arrappend(key, path, item)
-            return bool(result and result[0] is not None)
+            return bool(result and None not in result)
         
         except redis.exceptions.ResponseError as e: # type: ignore
             print(f"❌ Errore: Stai cercando di aggiungere dati a un campo che non è una lista! {e}")
@@ -176,3 +177,50 @@ class RedisClient:
                 print(f"Fermando canale: {channel}")
                 stop_event.set()
         self._active_subscriptions.clear()
+
+    # --- METODI STREAM (Event Logging & History) ---
+
+    def log_event(self, stream_name: str, event_data: dict, max_len: int = 2000) -> Optional[str] | ResponseT:
+        """
+        Aggiunge un evento allo stream. Usa max_len per mantenere il log snello (FIFO).
+
+        Args:
+            stream_name (str): Il nome della chiave dello stream su Redis.
+            event_data (dict): Dizionario contenente i dati dell'evento (coppie chiave-valore).
+            max_len (int, optional): Numero massimo di elementi da mantenere nello stream. 
+                Default a 2000.
+
+        Returns:
+            Optional[str]: L'ID generato per la nuova entry (formato 'timestamp-sequence') 
+                o None in caso di errore.
+        """
+        try:
+            # XADD nome_stream MAXLEN ~ 2000 * campi...
+            # Il simbolo '*' genera automaticamente l'ID basato sul timestamp
+            entry_id = self.client.xadd(name=stream_name, fields=event_data, maxlen=max_len, 
+                approximate=True  # Più efficiente: non taglia esattamente a 2000 ma quando comodo a Redis
+            )
+            return entry_id
+        except Exception as e:
+            print(f"❌ Errore Stream XADD su {stream_name}: {e}")
+            return None
+
+    def get_recent_events(self, stream_name: str, count: int = 10) -> list | ResponseT:
+        """
+        Recupera gli ultimi N eventi dallo stream.
+
+        Args:
+            stream_name (str): Il nome dello stream da interrogare.
+            count (int, optional): Numero di eventi recenti da restituire. Default a 10.
+
+        Returns:
+            List[Any]: Una lista di tuple o dizionari (a seconda della config del client) 
+                contenenti ID e dati degli eventi. Ritorna una lista vuota in caso di errore.
+        """
+        try:
+            # XREVRANGE legge dallo stream al contrario (dal più recente)
+            events = self.client.xrevrange(stream_name, max='+', min='-', count=count)
+            return events
+        except Exception as e:
+            print(f"⚠️ Errore lettura stream {stream_name}: {e}")
+            return []
