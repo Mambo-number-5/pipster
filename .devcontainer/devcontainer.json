@@ -8,15 +8,18 @@
     // Diciamo a VS Code di entrare nel servizio "bot"
     "service": "bot",
     "workspaceFolder": "/app",
-
+    // Questa parte silenzia il warning nel terminale di VS Code
+    "containerEnv": {
+        "PIP_ROOT_USER_ACTION": "ignore"
+    },
     "customizations": {
         "vscode": {
             "extensions": [
-                "ms-python.python",              // Supporto Python
-                "ms-python.vscode-pylance",      // Suggerimenti intelligenti (risolve le linee rosse)
-                "njpwerner.autodocstring",       // Per documentare la statistica velocemente
-                "ms-azuretools.vscode-docker",   // Gestione container da VS Code
-                "redhat.vscode-yaml"             // Autocompletamento per i file .yml
+                "ms-python.python", // Supporto Python
+                "ms-python.vscode-pylance", // Suggerimenti intelligenti (risolve le linee rosse)
+                "njpwerner.autodocstring", // Per documentare la statistica velocemente
+                "ms-azuretools.vscode-docker", // Gestione container da VS Code
+                "redhat.vscode-yaml" // Autocompletamento per i file .yml
             ],
             "settings": {
                 // Usa il Python del container, dove CCXT e Redis sono già installati
@@ -26,10 +29,8 @@
             }
         }
     },
-
     // Una volta creato il container, installa le dipendenze se mancano
     "postCreateCommand": "pip install -r requirements.txt",
-
     // Permette al debugger di connettersi internamente
     "remoteUser": "root"
 }
