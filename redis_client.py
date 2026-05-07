@@ -224,3 +224,76 @@ class RedisClient:
         except Exception as e:
             print(f"⚠️ Errore lettura stream {stream_name}: {e}")
             return []
+
+    # --- CONSUMER GROUPS (Resilienza e Scalabilità) ---
+    def create_consumer_group(self, stream_name: str, group_name: str) -> None:
+        """
+        Crea un gruppo di consumatori per uno stream specifico. 
+        Se lo stream non esiste, viene creato automaticamente (MKSTREAM).
+
+        Args:
+            stream_name (str): Nome dello stream Redis.
+            group_name (str): Nome del gruppo di consumatori da creare.
+        
+        Note:
+            Viene usato l'ID '0' per indicare al gruppo di iniziare a leggere dall'inizio della storia dello stream.
+        """
+        try:
+            # id='0' = Leggi tutto dall'inizio. Usa id='$' per leggere solo i nuovi arrivi da ora in poi.
+            self.client.xgroup_create(stream_name, group_name, id='0', mkstream=True)
+        except redis.exceptions.ResponseError as e: # type: ignore
+            # Ignoriamo l'errore se il gruppo esiste già, altrimenti lo segnaliamo
+            if "already exists" not in str(e):
+                print(f"❌ Errore creazione gruppo: {e}")
+
+    def read_group(self, stream_name: str, group_name: str, consumer_name: str, last_id: str = '>', count: int = 1, block: int = 0) -> list[Any]| ResponseT:
+        """
+        Legge messaggi inediti destinati a un consumatore specifico all'interno di un gruppo.
+
+        Args:
+            stream_name (str): Nome dello stream.
+            group_name (str): Nome del gruppo di consumatori.
+            consumer_name (str): Nome univoco del consumatore (es. 'worker-1').
+            last_id (str): L'ID da cui partire. 
+                - ">" per nuovi messaggi mai consegnati.
+                - "0" per messaggi in sospeso (PENDING) non ancora confermati.
+            count (int, optional): Numero massimo di messaggi da prelevare. Default 1.
+            block (int, optional): Tempo di attesa in millisecondi (0 = infinito). 
+                Se > 0, il metodo diventa bloccante finché non arriva un messaggio.
+
+        Returns:
+            List[Any]: Lista di messaggi ricevuti. Formato tipico: 
+                [[b'stream_name', [(b'id', {b'chiave': b'valore'})]]]
+        """
+        try:
+            # L'ID '>' indica a Redis di consegnare solo messaggi "nuovi" (mai letti dal gruppo)
+            return self.client.xreadgroup(
+                groupname=group_name, 
+                consumername=consumer_name, 
+                streams={stream_name: last_id}, 
+                count=count, 
+                block=block
+            )
+        except Exception as e:
+            print(f"⚠️ Errore lettura gruppo {group_name}: {e}")
+            return []
+
+    def acknowledge(self, stream_name: str, group_name: str, message_id: str) -> bool:
+        """
+        Conferma l'avvenuta elaborazione di un messaggio (XACK). 
+        Rimuove il messaggio dalla PEL (Pending Entries List) del gruppo.
+
+        Args:
+            stream_name (str): Nome dello stream.
+            group_name (str): Nome del gruppo di consumatori.
+            message_id (str): L'ID del messaggio da confermare.
+
+        Returns:
+            bool: True se il messaggio è stato confermato correttamente, False altrimenti.
+        """
+        try:
+            # Ritorna il numero di messaggi confermati (dovrebbe essere 1)
+            return bool(self.client.xack(stream_name, group_name, message_id))
+        except Exception as e:
+            print(f"❌ Errore XACK per ID {message_id}: {e}")
+            return False

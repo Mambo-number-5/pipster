@@ -117,6 +117,48 @@ class TestRedisProfessional(unittest.TestCase):
         self.assertEqual(recent[0][1]["module"], "STRATEGY")
         print(f"   -> Evento loggato con ID: {entry_id}")
 
+    def test_05_consumer_group_resilience(self):
+        """Verifica la capacità di ripresa (Recovery) dopo un finto crash"""
+        print("\n[TEST] Verifica Resilienza Consumer Groups (Recovery)...")
+        
+        stream = "trading_signals"
+        group = "bot_group"
+        consumer = "worker_1"
+        
+        # 1. Prepariamo lo stream e il gruppo
+        self.db.create_consumer_group(stream, group)
+        
+        # 2. Inviamo un segnale di trading
+        signal = {"action": "BUY", "asset": "ETHUSD"}
+        self.db.log_event(stream, signal)
+        
+        # 3. Il bot legge il messaggio (Simuliamo l'inizio dell'elaborazione)
+        # Usiamo '>' per prendere il messaggio nuovo
+        messages = self.db.read_group(stream, group, consumer, last_id='>') 
+        self.assertEqual(len(messages), 1)
+        msg_id = messages[0][1][0][0] # Estraiamo l'ID del messaggio ricordando che: [[b'stream_name', [(b'id', {b'chiave': b'valore'})]]]
+        print(f"   -> Messaggio {msg_id} ricevuto, ma NON confermato (Simulo Crash).")
+
+        # --- QUI IL BOT "CRASHA" (non chiamiamo acknowledge) ---
+
+        # 4. Il bot si riavvia e cerca messaggi PENDING (non confermati)
+        # Usiamo '0' invece di '>'
+        recovery_messages = self.db.read_group(stream, group, consumer, last_id='0')
+        
+        self.assertEqual(len(recovery_messages), 1)
+        recovered_id = recovery_messages[0][1][0][0]
+        recovered_data = recovery_messages[0][1][0][1]
+        
+        self.assertEqual(msg_id, recovered_id)
+        self.assertEqual(recovered_data["asset"], "ETHUSD")
+        print(f"   -> Recupero riuscito: Il messaggio {recovered_id} era ancora in coda.")
+
+        # 5. Ora confermiamo e verifichiamo che la coda sia finalmente vuota
+        self.db.acknowledge(stream, group, msg_id)
+        final_check = self.db.read_group(stream, group, consumer, last_id='0')
+        self.assertEqual(len(final_check[0][1]), 0)
+        print("   -> Messaggio confermato e rimosso dalla coda dei pendenti.")
+
     def tearDown(self):
         """Eseguito DOPO ogni singolo test: ferma le sottoscrizioni per evitare leak di thread"""
         self.db.stop_all_subscriptions()
