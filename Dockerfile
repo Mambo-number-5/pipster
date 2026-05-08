@@ -1,34 +1,27 @@
 FROM python:3.11-slim
 
-# Silenzia il warning di pip come root
-ENV PIP_ROOT_USER_ACTION=ignore
-
-# Dipendenze di sistema (necessarie per compilare alcune librerie di trading/math)
+# 1. Installazione pacchetti di sistema (Il blocco più pesante: 450MB)
+# Lo mettiamo in cima perché una volta fatto, non lo toccherai quasi mai.
 RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# 2. Solo ora dichiariamo le variabili di ambiente utili per l'installazione delle librerie di 'pip'.
+ENV PIP_ROOT_USER_ACTION=ignore
+
 WORKDIR /app
 
-# Sfruttiamo la cache di Docker per le dipendenze
+# 3. Copia dipendenze Python
 COPY requirements.txt .
 
-# 2. PRIMA ZONA: Cache per l'aggiornamento di pip
+# 4. Installazione con Cache Mount (Ora funzionerà con BuildKit attivo)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --upgrade pip
-
-# 3. SECONDA ZONA: Cache per le dipendenze del progetto
-# Nota: ho tolto --no-cache-dir qui, perché ora la cache la gestisce Docker col mount
-RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Copia il resto del progetto
+# 5. Copia del codice
 COPY . .
 
-# Il comando CMD della Versione 2 è perfetto per il debug, però qui siamo in produzione ed è meglio una semplice chiamata al main
-# per il debug inserire in un file docker-compose.override.yml la vecchia versione per lanciare:
-# CMD["python", "-Xfrozen_modules=off", "-m debugpy", "--listen 0.0.0.0:5678", "--wait-for-client", "main.py"]
-# --wait-for-client blocca l'esecuzione finché non premi F5 su VS Codes
 CMD ["python", "main.py"]

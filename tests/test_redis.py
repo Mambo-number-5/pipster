@@ -35,9 +35,7 @@ class TestRedisProfessional(unittest.TestCase):
         self.db.set_json(key, data)
         res = self.db.get_json(key)
         
-        # NOTA: Se hai usato il mio wrapper rifattorizzato, 'res' è già il dizionario.
-        # Se usi il tuo vecchio codice, devi mantenere res[0].
-        # Assumendo il wrapper 'clean':
+        # NOTA: Con l'ultima versione del mio wrapper, 'res' è già il dizionario.
         self.assertEqual(res["symbol"], "BTCUSD")
         
         history_key = "history:BTCUSD:1m"

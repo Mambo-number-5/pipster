@@ -1,6 +1,7 @@
 # Configurazione Editor e IDE
 .vscode/
 .idea/
+.devcontainer/
 
 # Credenziali (FONDAMENTALE: non devono finire nell'immagine)
 .env
