@@ -48,7 +48,7 @@ class TestRedisProfessional(unittest.TestCase):
         history = self.db.get_json(history_key)
         # Con wrapper clean, history è direttamente la lista:
         self.assertEqual(len(history), 2)
-        self.assertEqual(history[1]["c"], 65050)
+        self.assertEqual(history[-1]["c"], 65050)
         print("   -> RedisJSON gestisce correttamente gli array di candele.")
 
     def test_02_multithreading_pubsub(self):
@@ -80,6 +80,7 @@ class TestRedisProfessional(unittest.TestCase):
             counter["count"] += 1
 
         self.db.subscribe_in_background("FEED", fast_callback)
+        time.sleep(1.5)
         
         # Inondiamo Redis di piccoli aggiornamenti JSON
         for i in range(10):
@@ -156,6 +157,55 @@ class TestRedisProfessional(unittest.TestCase):
         final_check = self.db.read_group(stream, group, consumer, last_id='0')
         self.assertEqual(len(final_check[0][1]), 0)
         print("   -> Messaggio confermato e rimosso dalla coda dei pendenti.")
+    
+    def test_06_dead_letter_queue_flow(self):
+        """Verifica che un messaggio fallito troppe volte finisca nella DLQ"""
+        print("\n[TEST] Verifica Flusso Dead Letter Queue (Poison Message)...")
+        
+        stream = "signals"
+        group = "trading_group"
+        consumer = "bot_1"
+        dlq_stream = f"{stream}:errors"
+        MAX_RETRIES = 3
+
+        self.db.create_consumer_group(stream, group)
+        
+        # 1. Inseriamo un messaggio "velenoso"
+        msg_payload = {"cmd": "CRASH_ME", "data": "corrupted_value"}
+        self.db.log_event(stream, msg_payload)
+
+        # 1.1 PRIMA LETTURA (ID '>'): Sposta il messaggio nella PEL
+        self.db.read_group(stream, group, consumer, last_id='>')
+
+        # 2. LETTURE SUCCESSIVE (ID '0'): Incrementa il counter times_delivered
+        # Lo leggiamo altre 3 volte (totale 4 consegne)
+        for _ in range(3):
+            self.db.read_group(stream, group, consumer, last_id='0')
+
+        # 3. LOGICA DI CONTROLLO (Quella del Worker)
+        pending_info = self.db.get_pending_messages(stream, group)
+        
+        found_poison = False
+        for info in pending_info:
+            if info['times_delivered'] > MAX_RETRIES:
+                # Recuperiamo i dati originali per non perderli
+                data = self.db.get_message_by_id(stream, info['message_id'])
+                
+                if data:
+                    # SPOSTAMENTO: Lo mettiamo nella DLQ e lo confermiamo nel principale
+                    self.db.log_event(dlq_stream, data)
+                    self.db.acknowledge(stream, group, info['message_id'])
+                    found_poison = True
+
+        self.assertTrue(found_poison, "Il sistema dovrebbe aver identificato il messaggio velenoso")
+
+        # 4. Verifica Finale: Lo stream principale è pulito, la DLQ ha il messaggio
+        remaining_pending = self.db.get_pending_messages(stream, group)
+        self.assertEqual(len(remaining_pending), 0, "Lo stream principale dovrebbe essere vuoto dopo l'ACK")
+        
+        dlq_data = self.db.get_recent_events(dlq_stream, count=1)
+        self.assertEqual(dlq_data[0][1]["cmd"], "CRASH_ME")
+        print("   -> Successo: Messaggio velenoso isolato nella DLQ senza bloccare il bot.")
 
     def tearDown(self):
         """Eseguito DOPO ogni singolo test: ferma le sottoscrizioni per evitare leak di thread"""

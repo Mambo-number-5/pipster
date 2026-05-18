@@ -2,8 +2,7 @@ import redis
 import os
 import threading
 import json
-from typing import Any, Optional, Callable
-from redis.typing import ResponseT
+from typing import Any, Optional, Callable, cast
 
 class RedisClient:
     """
@@ -124,7 +123,7 @@ class RedisClient:
         """
         if isinstance(message, (dict, list)):
             message = json.dumps(message)
-        return bool(self.client.publish(channel, message))
+        return cast(int, self.client.publish(channel, message))
 
 
     def subscribe_in_background(self, channel: str, callback: Callable) -> threading.Event:
@@ -180,7 +179,7 @@ class RedisClient:
 
     # --- METODI STREAM (Event Logging & History) ---
 
-    def log_event(self, stream_name: str, event_data: dict, max_len: int = 2000) -> Optional[str] | ResponseT:
+    def log_event(self, stream_name: str, event_data: dict, max_len: int = 2000) -> Optional[str]:
         """
         Aggiunge un evento allo stream. Usa max_len per mantenere il log snello (FIFO).
 
@@ -200,12 +199,12 @@ class RedisClient:
             entry_id = self.client.xadd(name=stream_name, fields=event_data, maxlen=max_len, 
                 approximate=True  # Più efficiente: non taglia esattamente a 2000 ma quando comodo a Redis
             )
-            return entry_id
+            return cast(str, entry_id)
         except Exception as e:
             print(f"❌ Errore Stream XADD su {stream_name}: {e}")
             return None
 
-    def get_recent_events(self, stream_name: str, count: int = 10) -> list | ResponseT:
+    def get_recent_events(self, stream_name: str, count: int = 10) -> list:
         """
         Recupera gli ultimi N eventi dallo stream.
 
@@ -219,7 +218,7 @@ class RedisClient:
         """
         try:
             # XREVRANGE legge dallo stream al contrario (dal più recente)
-            events = self.client.xrevrange(stream_name, max='+', min='-', count=count)
+            events = cast(list, self.client.xrevrange(stream_name, max='+', min='-', count=count))
             return events
         except Exception as e:
             print(f"⚠️ Errore lettura stream {stream_name}: {e}")
@@ -246,7 +245,7 @@ class RedisClient:
             if "already exists" not in str(e):
                 print(f"❌ Errore creazione gruppo: {e}")
 
-    def read_group(self, stream_name: str, group_name: str, consumer_name: str, last_id: str = '>', count: int = 1, block: int = 0) -> list[Any]| ResponseT:
+    def read_group(self, stream_name: str, group_name: str, consumer_name: str, last_id: str = '>', count: int = 1, block: int = 0) -> list[Any]:
         """
         Legge messaggi inediti destinati a un consumatore specifico all'interno di un gruppo.
 
@@ -267,13 +266,14 @@ class RedisClient:
         """
         try:
             # L'ID '>' indica a Redis di consegnare solo messaggi "nuovi" (mai letti dal gruppo)
-            return self.client.xreadgroup(
+            result = self.client.xreadgroup(
                 groupname=group_name, 
                 consumername=consumer_name, 
                 streams={stream_name: last_id}, 
                 count=count, 
                 block=block
             )
+            return cast(list, result)
         except Exception as e:
             print(f"⚠️ Errore lettura gruppo {group_name}: {e}")
             return []
@@ -297,3 +297,77 @@ class RedisClient:
         except Exception as e:
             print(f"❌ Errore XACK per ID {message_id}: {e}")
             return False
+    
+    def get_pending_messages(self, stream: str, group: str, count: int = 10) -> list[dict]:
+        """
+        Interroga la Pending Entries List (PEL) di un Consumer Group.
+
+        Recupera informazioni dettagliate sui messaggi che sono stati consegnati ai 
+        consumer ma non sono ancora stati confermati con un ACK. Questo metodo è 
+        fondamentale per implementare logiche di recovery (riassegnazione messaggi) 
+        e per identificare 'Poison Messages' (messaggi velenosi).
+
+        Args:
+            stream (str): Il nome dello stream da interrogare.
+            group (str): Il nome del gruppo di consumatori associato allo stream.
+            count (int, optional): Numero massimo di messaggi pendenti da restituire. 
+                Default è 10.
+
+        Returns:
+            list[dict]: Una lista di dizionari, dove ogni dizionario contiene:
+                - 'message_id' (str): L'ID univoco del messaggio in Redis (es. '1714400000-0').
+                - 'consumer' (str): Il nome del consumer che ha attualmente in carico il messaggio.
+                - 'time_since_delivered' (int): Millisecondi passati dall'ultima consegna.
+                - 'times_delivered' (int): Numero totale di tentativi di consegna effettuati.
+
+        Raises:
+            redis.exceptions.RedisError: In caso di problemi di connessione o se 
+                lo stream/gruppo non esistono.
+
+        Note:
+            Viene utilizzato il comando `XPENDING` con il range completo (da '-' a '+').
+            Se il counter 'times_delivered' è significativamente più alto di 1, 
+            potrebbe indicare che il messaggio causa un crash del consumer.
+        """
+        try:
+            # XPENDING <stream> <group> <min> <max> <count>
+            # '-' e '+' indicano rispettivamente l'ID minimo e massimo possibile.
+            return cast(list, self.client.xpending_range(stream, group, min='-', max='+', count=count))
+        except Exception as e:
+            print(f"⚠️ Errore durante l'interrogazione XPENDING su {stream}: {e}")
+            return []
+    
+    def get_message_by_id(self, stream: str, msg_id: str) -> Optional[dict]:
+        """
+        Recupera il contenuto di un singolo messaggio specifico tramite il suo ID.
+
+        A differenza di `read_group`, questo metodo non interagisce con i cursori 
+        del Consumer Group e non sposta il puntatore di lettura. Viene utilizzato 
+        principalmente durante le fasi di recovery o per isolare i dati di un 
+        'Poison Message' prima di spostarlo nella Dead Letter Queue.
+
+        Args:
+            stream (str): Il nome dello stream in cui cercare il messaggio.
+            msg_id (str): L'ID univoco del messaggio Redis (es. '1714400000-0').
+
+        Returns:
+            Optional[dict]: Il dizionario contenente i dati del messaggio se trovato, 
+                altrimenti None.
+
+        Note:
+            Internamente utilizza il comando `XRANGE` impostando sia l'ID minimo 
+            che l'ID massimo al valore di `msg_id`. Questo garantisce il recupero 
+            esatto del record cercato.
+        """
+        try:
+            # XRANGE stream_name start end [COUNT n]
+            res = cast(list, self.client.xrange(stream, min=msg_id, max=msg_id, count=1))
+            
+            # La struttura restituita da xrange è: [[ID, {campi}]]
+            if res and len(res) > 0:
+                return cast(dict, res[0][1])
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ Errore nel recupero puntuale del messaggio {msg_id}: {e}")
+            return None

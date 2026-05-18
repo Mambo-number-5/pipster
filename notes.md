@@ -67,9 +67,44 @@ Da copiare nel file `docker-compose.override.yml` in base a cosa vuoi testare. R
 *   **Eseguire un modulo test come script (usa `if __name__ == "__main__":`):**
     `command: python -Xfrozen_modules=off -m debugpy --listen 0.0.0.0:5678 --wait-for-client tests/test_redis.py`
 
----
-
 **Perché queste varianti?**
 1.  **`-m unittest`**: È utile perché non ti obbliga a inserire il blocco `main` in ogni file di test; Python cercherà automaticamente tutte le funzioni che iniziano con `test_`.
 2.  **Percorso con i punti (`tests.test_redis...`)**: Necessario quando usi il flag `-m`, perché Python tratta il file come un modulo del pacchetto.
 3.  **Percorso con lo slash (`tests/test_redis.py`)**: Si usa quando lanci il file direttamente come script.
+
+---
+09/05/2026
+# 🛠 Architettura e Logica del Bot
+
+## 🔄 Gestione Flusso Consumer Groups (Streams)
+Il bot utilizza i Redis Streams con Consumer Groups per garantire che nessun segnale di trading venga perso (**At-Least-Once Delivery**).
+
+### 1. Il Ciclo di Vita del Segnale
+La logica di consumo è implementata nel `professional_worker_loop` (Logica di Business) e si appoggia al [RedisClient](redis_client.py) (Data Layer).
+
+*   **Recupero (Recovery):** All'avvio, il bot interroga la **PEL (Pending Entries List)** usando l'ID `0`. Questo permette di riprendere messaggi letti ma mai confermati (es. a causa di un crash).
+*   **Identificazione Poison Messages:** Tramite `get_pending_messages`, monitoriamo il contatore `times_delivered`. 
+*   **Dead Letter Queue (DLQ):** Se un messaggio supera la soglia di `MAX_RETRIES` (default 3), viene considerato "velenoso" (causa crash). Viene spostato in `stream:errors` e rimosso dalla coda principale tramite `XACK`.
+
+### 2. Funzioni Chiave
+
+#### `professional_worker_loop(db, stream, group, consumer)`
+*   **Scopo:** Gestire il loop infinito di ascolto segnali in modo resiliente.
+*   **Logica Interna:**
+    1. Verifica messaggi bloccati nella PEL.
+    2. Sposta eventuali messaggi falliti nella DLQ.
+    3. Ascolta nuovi messaggi con `last_id='>'`.
+    4. Esegue la logica di trading e invia `XACK` solo a operazione conclusa.
+
+#### `get_pending_messages(stream, group, count)`
+Interroga `XPENDING` per ottenere i metadati dei messaggi non confermati. Restituisce una lista di dict con `message_id` e `times_delivered`.
+
+## ⚠️ Note Tecniche e "Gotchas"
+*   **Recupero dati per ID:** Non usare `XREADGROUP` per ottenere un singolo messaggio di cui si conosce l'ID. Usare invece `XRANGE stream_name id id`.
+*   **PEL Activation:** Un messaggio entra nella PEL solo dopo la **prima** lettura con ID `>`.
+*   **FlushDB:** Nei test, usare sempre `flushdb()` per isolare le suite, ma assicurarsi di essere sul DB corretto (es. 15) per non piallare la produzione.
+
+ID Usato,Cosa legge?,Stato del Messaggio
+>,Solo nuovi messaggi,Mai consegnati a nessuno nel gruppo
+0,Solo messaggi pendenti,Consegnati a questo consumer ma non confermati
+XRANGE,Messaggio specifico,"Usato per ""estrarre"" i dati senza muovere i cursori"
