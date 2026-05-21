@@ -207,6 +207,74 @@ class TestRedisProfessional(unittest.TestCase):
         self.assertEqual(dlq_data[0][1]["cmd"], "CRASH_ME")
         print("   -> Successo: Messaggio velenoso isolato nella DLQ senza bloccare il bot.")
 
+    def test_07_hash_and_json_trimming(self):
+        """Test combinato: verifica le performance degli Hash e la prevenzione dei leak sui JSON"""
+        print("\n[TEST] Verifica Hash Layer & Trimming Array JSON...")
+        
+        # 1. Verifica Operazioni Hash (Fast Cache Layer)
+        hash_key = "ticker:live:BTCUSDT"
+        tick_data = {"price": "67500.50", "volume": "1.245", "updated_at": str(time.time())}
+        
+        self.assertTrue(self.db.set_hash(hash_key, tick_data, expire_seconds=10))
+        
+        # Lettura completa dell'hash
+        cached_hash = self.db.get_hash(hash_key)
+        self.assertEqual(cached_hash["price"], "67500.50")
+        
+        # Lettura puntuale di un singolo campo (O(1))
+        single_field = self.db.get_hash_field(hash_key, "volume")
+        self.assertEqual(single_field, "1.245")
+        print("   -> Strutture Hash caricate e interrogate correttamente in O(1).")
+        
+        # 2. Verifica Trimming automatico per evitare Memory Leak su JSON
+        list_key = "history:limited:candles"
+        for i in range(5):
+            # Forziamo un tetto massimo di 3 elementi nell'array JSON
+            self.db.append_to_list(list_key, {"candle_id": i}, max_len=3)
+            
+        final_list = self.db.get_json(list_key)
+        # Nonostante i 5 inserimenti, la lista deve contenere solo gli ultimi 3 elementi
+        self.assertEqual(len(final_list), 3)
+        self.assertEqual(final_list[0]["candle_id"], 2)  # Il più vecchio superstite
+        self.assertEqual(final_list[-1]["candle_id"], 4) # L'ultimo inserito
+        print("   -> Trimming JSON funzionante: la memoria è protetta dalla saturazione.")
+
+    def test_08_distributed_autoclaim_recovery(self):
+        """Verifica il recupero dei messaggi pendenti orfani da parte di un worker differente"""
+        print("\n[TEST] Verifica Bilanciamento e Recovery con XAUTOCLAIM...")
+        
+        stream = "distributed_signals"
+        group = "cluster_group"
+        dead_consumer = "worker_defunto_1"
+        alive_consumer = "worker_attivo_2"
+        
+        self.db.create_consumer_group(stream, group)
+        self.db.log_event(stream, {"task": "EXECUTE_ORDER", "size": "0.1"})
+        
+        # Il vecchio worker prende il messaggio ma scompare (non dà ACK)
+        dead_messages = self.db.read_group(stream, group, dead_consumer, last_id='>')
+        self.assertEqual(len(dead_messages), 1)
+        original_msg_id = dead_messages[0][1][0][0]
+        
+        # Simuliamo un'attesa minima prima del controllo di recupero
+        # (Nel codice reale metterai ad esempio 30000ms, qui usiamo 0ms per velocizzare il test)
+        next_id, claimed_messages = self.db.autoclaim_messages(
+            stream_name=stream,
+            group_name=group,
+            consumer_name=alive_consumer,
+            min_idle_time_ms=0,
+            count=10
+        )
+        
+        # Il worker attivo deve essere riuscito a "rubare" il messaggio rimasto appeso
+        self.assertEqual(len(claimed_messages), 1)
+        self.assertEqual(claimed_messages[0][0], original_msg_id)
+        self.assertEqual(claimed_messages[0][1]["task"], "EXECUTE_ORDER")
+        
+        # Chiudiamo la pendenza con il nuovo worker attivo
+        self.assertTrue(self.db.acknowledge(stream, group, original_msg_id))
+        print(f"   -> XAUTOCLAIM riuscito: {alive_consumer} ha salvato il messaggio bloccato da {dead_consumer}.")
+
     def tearDown(self):
         """Eseguito DOPO ogni singolo test: ferma le sottoscrizioni per evitare leak di thread"""
         self.db.stop_all_subscriptions()

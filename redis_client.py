@@ -83,30 +83,41 @@ class RedisClient:
             print(f"Errore RedisJSON get: {e}")
             return default
 
-
-    def append_to_list(self, key: str, item: Any, path: str = "$") -> bool:
+    def append_to_list(self, key: str, item: Any, path: str = "$", max_len: int = 0) -> bool:
         """
         Aggiunge atomicamente un elemento a un array JSON esistente. 
-        Ideale per lo streaming di candele senza dover ri-caricare l'intero storico.
+        Se max_len è specificato, taglia l'array mantenendo solo gli ultimi N elementi,
+        prevenendo saturazioni della memoria (Memory Leak).
 
         Args:
             key (str): La chiave dell'array JSON.
             item (Any): L'elemento (es. dizionario candela) da aggiungere in coda.
             path (str, opzionale): Il percorso dell'array all'interno del JSON. Default "$".
+            max_len (int, opzionale): Numero massimo di elementi da mantenere. Se l'array 
+                                      supera questo limite, i più vecchi vengono scartati.
         Returns:
-            bool: True se l'elemento è stato aggiunto, False se la chiave non esiste o non è un array.
+            bool: True se l'elemento è stato aggiunto (e l'array eventualmente tagliato), 
+                  False se la chiave non esiste o non è un array.
         """
         try:
             # Se la chiave non esiste, inizializzala come lista vuota
             if not self.client.exists(key):
                 self.set_json(key, [])
+            
+            # Aggiunge il nuovo elemento
             result = self.client.json().arrappend(key, path, item)
+            
+            # Operazione di Trimming: mantiene solo gli ultimi 'max_len' elementi
+            if max_len > 0:
+                # Utilizzando indici negativi (-max_len a -1), Redis taglia l'inizio della lista 
+                # mantenendo intatta la "coda" più recente.
+                self.client.json().arrtrim(key, path, -max_len, -1)
+                
             return bool(result and None not in result)
         
         except redis.exceptions.ResponseError as e: # type: ignore
             print(f"❌ Errore: Stai cercando di aggiungere dati a un campo che non è una lista! {e}")
             return False
-
 
     # --- METODI PUB/SUB (Mantenuti per il flusso dal Broker) ---
 
@@ -370,4 +381,114 @@ class RedisClient:
             
         except Exception as e:
             print(f"⚠️ Errore nel recupero puntuale del messaggio {msg_id}: {e}")
+            return None
+    
+    def autoclaim_messages(self, stream_name: str, group_name: str, consumer_name: str, min_idle_time_ms: int, start_id: str = '0', count: int = 10) -> tuple[str, list]:
+        """
+        Rivendica (claim) i messaggi bloccati nella PEL (Pending Entries List) da troppo tempo,
+        riassegnandoli a questo consumer. Fondamentale per la recovery post-crash.
+
+        Args:
+            stream_name (str): Nome dello stream Redis.
+            group_name (str): Nome del gruppo di consumatori.
+            consumer_name (str): Il nome del worker ATTUALE che sta rivendicando i messaggi.
+            min_idle_time_ms (int): Tempo minimo in millisecondi da cui il messaggio deve 
+                                    essere "pending" prima di poter essere rubato.
+            start_id (str, optional): L'ID da cui iniziare la scansione della PEL. Default '0'.
+            count (int, optional): Numero massimo di messaggi da rivendicare in una chiamata.
+
+        Returns:
+            tuple[str, list]: Una tupla contenente:
+                - Il prossimo ID da cui continuare la scansione per l'autoclaim successivo.
+                - Una lista dei messaggi rivendicati con successo (formato identico a read_group).
+        """
+        try:
+            # XAUTOCLAIM <stream> <group> <consumer> <min-idle-time> <start> [COUNT count]
+            # Restituisce il nuovo puntatore e i messaggi recuperati
+            result = cast(list, self.client.xautoclaim(
+                name=stream_name,
+                groupname=group_name,
+                consumername=consumer_name,
+                min_idle_time=min_idle_time_ms,
+                start_id=start_id,
+                count=count
+            ))
+            
+            # Redis-py restituisce una lista/tupla dove l'elemento 0 è il next_id 
+            # e l'elemento 1 è la lista dei messaggi.
+            next_start_id = result[0]
+            claimed_messages = result[1]
+            
+            return cast(str, next_start_id), cast(list, claimed_messages)
+            
+        except Exception as e:
+            print(f"⚠️ Errore durante l'XAUTOCLAIM sullo stream {stream_name}: {e}")
+            return start_id, []
+    
+    # --- METODI HASH (Fast Cache Layer - Latenza Minima) ---
+    def set_hash(self, key: str, mapping: dict[str, Any], expire_seconds: Optional[int] = None) -> bool:
+        """
+        Scrive o aggiorna in modo atomico più campi all'interno di un Hash Redis (HSET).
+
+        Rappresenta il layer a latenza minima (complessità temporale O(1)) ideale per 
+        memorizzare snapshot in tempo reale (es. ticker di mercato, metriche ad alta 
+        frequenza o indicatori volatili) che non richiedono strutture annidate.
+
+        Args:
+            key (str): Chiave identificativa dell'Hash (es. 'ticker:live:BTCUSDT').
+            mapping (dict[str, Any]): Dizionario contenente le coppie campo-valore da salvare.
+            expire_seconds (int, opzionale): Tempo di scadenza della chiave in secondi (TTL).
+
+        Returns:
+            bool: True se la scrittura ha avuto successo, False in caso di eccezioni.
+        """
+        try:
+            self.client.hset(key, mapping=mapping)
+            if expire_seconds:
+                self.client.expire(key, expire_seconds)
+            return True
+        except Exception as e:
+            print(f"❌ Errore Redis Hash HSET su {key}: {e}")
+            return False
+
+    def get_hash(self, key: str) -> dict[str, str]:
+        """
+        Recupera l'intero contenuto di un Hash Redis (HGETALL).
+
+        Restituisce tutti i campi e i valori associati alla chiave specificata. Avendo 
+        configurato il client con `decode_responses=True`, i tipi restituiti vengono 
+        automaticamente convertiti in stringhe Python.
+
+        Args:
+            key (str): La chiave dell'Hash da interrogare.
+
+        Returns:
+            dict[str, str]: Dizionario con le coppie campo-valore estratte, 
+                            o un dizionario vuoto se la chiave non esiste.
+        """
+        try:
+            return cast(dict[str, str], self.client.hgetall(key))
+        except Exception as e:
+            print(f"⚠️ Errore lettura Hash HGETALL su {key}: {e}")
+            return {}
+
+    def get_hash_field(self, key: str, field: str) -> Optional[str]:
+        """
+        Recupera il valore di un singolo campo specifico all'interno di un Hash (HGET).
+
+        Sfrutta la complessità O(1) di Redis per estrarre selettivamente un dato 
+        senza dover caricare l'intera struttura in memoria, ottimizzando l'uso della banda.
+
+        Args:
+            key (str): La chiave dell'Hash.
+            field (str): Il nome del campo specifico da estrarre.
+
+        Returns:
+            Optional[str]: Il valore del campo come stringa, oppure None se la chiave 
+                           o il campo non esistono.
+        """
+        try:
+            return cast(Optional[str], self.client.hget(key, field))
+        except Exception as e:
+            print(f"⚠️ Errore lettura campo Hash HGET su {key}:{field}: {e}")
             return None
