@@ -18,7 +18,14 @@ class RedisClient:
         self.host = os.getenv("REDIS_HOST", "localhost")
         self.port = int(os.getenv("REDIS_PORT", 6379))
         self.db = int(os.getenv("REDIS_DB", 0)) # Default 0 per produzione
-        self.client = redis.Redis(host=self.host, port=self.port, db=self.db ,decode_responses=True)
+        self.client = redis.Redis(host=self.host,
+                                port=self.port,
+                                db=self.db,
+                                decode_responses=True,
+                                health_check_interval=30,  # Controlla la connessione in background ogni 30s
+                                retry_on_timeout=True,     # Ci riprova automaticamente se la rete fluttua
+                                socket_keepalive=True      # Mantiene il canale aperto con il container
+                                )
         
         # Lucchetto per garantire l'accesso thread-safe a risorse condivise interne
         self._lock = threading.Lock() 
@@ -51,6 +58,13 @@ class RedisClient:
             return bool(success)
         
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_write")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_write")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"Errore RedisJSON set: {e}")
             return False
 
@@ -80,6 +94,13 @@ class RedisClient:
                 return data
         
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_read")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_read")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"Errore RedisJSON get: {e}")
             return default
 
@@ -116,6 +137,13 @@ class RedisClient:
             return bool(result and None not in result)
         
         except redis.exceptions.ResponseError as e: # type: ignore
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_write")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_write")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"❌ Errore: Stai cercando di aggiungere dati a un campo che non è una lista! {e}")
             return False
 
@@ -132,10 +160,19 @@ class RedisClient:
         Returns:
             int: Il numero di client che hanno ricevuto il messaggio.
         """
-        if isinstance(message, (dict, list)):
-            message = json.dumps(message)
-        return cast(int, self.client.publish(channel, message))
-
+        try:
+            if isinstance(message, (dict, list)):
+                message = json.dumps(message)
+            return cast(int, self.client.publish(channel, message))
+        except Exception as e:
+            # Monitoraggio Errori
+            try:
+                self.client.incr("errors:counter:redis_pubsub")
+            except:
+                print("Errore nell'incremento del contatore redis_pubsub")
+                pass
+            print(f"❌ Errore Pub/Sub (Publish) su {channel}: {e}")
+            return 0
 
     def subscribe_in_background(self, channel: str, callback: Callable) -> threading.Event:
         """
@@ -151,25 +188,44 @@ class RedisClient:
         stop_event = threading.Event()
         
         def _worker():
-            pubsub = self.client.pubsub()
-            pubsub.subscribe(channel)
-            
-            while not stop_event.is_set():
-                # Il timeout permette al ciclo di controllare stop_event regolarmente
-                msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.5)
-                if msg:
-                    data = msg['data']
+            try:
+                pubsub = self.client.pubsub()
+                pubsub.subscribe(channel)
+                
+                while not stop_event.is_set():
                     try:
-                        data = json.loads(data)
-                    except:
-                        pass
-                    callback(data)
+                        # Il timeout permette al ciclo di controllare stop_event regolarmente
+                        msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=2)
+                        if msg:
+                            data = msg['data']
+                            try:
+                                data = json.loads(data)
+                            except:
+                                pass
+                            callback(data)
+                    except Exception as e:
+                        # Se cade la connessione nel thread, lo tracciamo
+                        try:
+                            self.client.incr("errors:counter:redis_pubsub")
+                        except:
+                            print("Errore nell'incremento del contatore redis_pubsub")
+                            pass
+                        print(f"❌ Errore nel thread in ascolto su {channel}: {e}")
+                        time.sleep(2.5) # Evita il surriscaldamento della CPU in caso di riavvio
             
-            pubsub.unsubscribe(channel)
-            pubsub.close()
-            # Cancellazione dell'elemento dal dizionario delle sottoscrizioni attive
-            with self._lock:
-                self._active_subscriptions.pop(channel, None) # Non esplode se la chiave è già sparita
+                pubsub.unsubscribe(channel)
+                pubsub.close()
+            except Exception as outer_e:
+                try:
+                    self.client.incr("errors:counter:redis_pubsub")
+                except:
+                    print("Errore nell'incremento del contatore redis_pubsub")
+                    pass
+                print(f"❌ Errore critico inibizione Pub/Sub {channel}: {outer_e}")
+            finally:
+                # Cancellazione dell'elemento dal dizionario delle sottoscrizioni attive
+                with self._lock:
+                    self._active_subscriptions.pop(channel, None) # Non esplode se la chiave è già sparita
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
@@ -205,13 +261,41 @@ class RedisClient:
                 o None in caso di errore.
         """
         try:
+            # Sanificazione dati: se un valore è una lista o un dizionario, lo trasformiamo in stringa JSON
+            sanitized_data = {}
+                
+            for k, valore in event_data.items():
+                # Chiamata singola all'inizio: estraiamo il tipo esatto
+                tipo_valore = type(valore)
+
+                # Confronto diretto della classe (molto più veloce di chiamare isinstance più volte)
+                if tipo_valore is str or tipo_valore is int or tipo_valore is float:
+                    sanitized_data[k] = valore
+
+                elif tipo_valore is bool:
+                    sanitized_data[k] = 1 if valore else 0
+
+                elif tipo_valore is dict or tipo_valore is list:
+                    sanitized_data[k] = json.dumps(valore)
+                
+                elif valore is not None:
+                    # Fallback sicuro per oggetti particolari, conversioni custom, ecc.
+                    sanitized_data[k] = str(valore)
+
             # XADD nome_stream MAXLEN ~ 2000 * campi...
             # Il simbolo '*' genera automaticamente l'ID basato sul timestamp
-            entry_id = self.client.xadd(name=stream_name, fields=event_data, maxlen=max_len, 
+            entry_id = self.client.xadd(name=stream_name, fields=sanitized_data, maxlen=max_len, 
                 approximate=True  # Più efficiente: non taglia esattamente a 2000 ma quando comodo a Redis
             )
             return cast(str, entry_id)
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_write")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_write")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+                
             print(f"❌ Errore Stream XADD su {stream_name}: {e}")
             return None
 
@@ -232,6 +316,13 @@ class RedisClient:
             events = cast(list, self.client.xrevrange(stream_name, max='+', min='-', count=count))
             return events
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_read")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_read")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore lettura stream {stream_name}: {e}")
             return []
 
@@ -255,6 +346,14 @@ class RedisClient:
             # Ignoriamo l'errore se il gruppo esiste già, altrimenti lo segnaliamo
             if "already exists" not in str(e):
                 print(f"❌ Errore creazione gruppo: {e}")
+            
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_admin")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_admin")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
 
     def read_group(self, stream_name: str, group_name: str, consumer_name: str, last_id: str = '>', count: int = 1, block: int = 0) -> list[Any]:
         """
@@ -286,6 +385,13 @@ class RedisClient:
             )
             return cast(list, result)
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_read")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_read")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore lettura gruppo {group_name}: {e}")
             return []
 
@@ -306,6 +412,13 @@ class RedisClient:
             # Ritorna il numero di messaggi confermati (dovrebbe essere 1)
             return bool(self.client.xack(stream_name, group_name, message_id))
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_admin")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_admin")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"❌ Errore XACK per ID {message_id}: {e}")
             return False
     
@@ -345,6 +458,13 @@ class RedisClient:
             # '-' e '+' indicano rispettivamente l'ID minimo e massimo possibile.
             return cast(list, self.client.xpending_range(stream, group, min='-', max='+', count=count))
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_admin")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_admin")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore durante l'interrogazione XPENDING su {stream}: {e}")
             return []
     
@@ -380,6 +500,13 @@ class RedisClient:
             return None
             
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_read")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_read")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore nel recupero puntuale del messaggio {msg_id}: {e}")
             return None
     
@@ -422,11 +549,18 @@ class RedisClient:
             return cast(str, next_start_id), cast(list, claimed_messages)
             
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_admin")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_admin")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore durante l'XAUTOCLAIM sullo stream {stream_name}: {e}")
             return start_id, []
     
     # --- METODI HASH (Fast Cache Layer - Latenza Minima) ---
-    def set_hash(self, key: str, mapping: dict[str, Any], expire_seconds: Optional[int] = None) -> bool:
+    def set_hash(self, key: str, mapping: dict[str, Any], expire_seconds: int = 0) -> bool:
         """
         Scrive o aggiorna in modo atomico più campi all'interno di un Hash Redis (HSET).
 
@@ -448,6 +582,13 @@ class RedisClient:
                 self.client.expire(key, expire_seconds)
             return True
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_write")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_write")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"❌ Errore Redis Hash HSET su {key}: {e}")
             return False
 
@@ -469,6 +610,13 @@ class RedisClient:
         try:
             return cast(dict[str, str], self.client.hgetall(key))
         except Exception as e:
+            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_read")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_read")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore lettura Hash HGETALL su {key}: {e}")
             return {}
 
@@ -490,5 +638,12 @@ class RedisClient:
         try:
             return cast(Optional[str], self.client.hget(key, field))
         except Exception as e:
+                        # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+            try:
+                self.client.incr("errors:counter:redis_read")
+            except Exception:
+                print("Errore nell'incremento del contatore redis_read")
+                pass # Evita che un problema di rete nel log generi un crash a catena
+
             print(f"⚠️ Errore lettura campo Hash HGET su {key}:{field}: {e}")
             return None
