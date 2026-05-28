@@ -3,6 +3,7 @@ import os
 import threading
 import json
 from typing import Any, Optional, Callable, cast
+import time
 
 class RedisClient:
     """
@@ -23,7 +24,6 @@ class RedisClient:
                                 db=self.db,
                                 decode_responses=True,
                                 health_check_interval=30,  # Controlla la connessione in background ogni 30s
-                                retry_on_timeout=True,     # Ci riprova automaticamente se la rete fluttua
                                 socket_keepalive=True      # Mantiene il canale aperto con il container
                                 )
         
@@ -62,7 +62,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_write")
             except Exception:
-                print("Errore nell'incremento del contatore redis_write")
+                print("Errore nell'incremento del contatore di errori redis_write")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"Errore RedisJSON set: {e}")
@@ -98,7 +98,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_read")
             except Exception:
-                print("Errore nell'incremento del contatore redis_read")
+                print("Errore nell'incremento del contatore di errori redis_read")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"Errore RedisJSON get: {e}")
@@ -141,7 +141,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_write")
             except Exception:
-                print("Errore nell'incremento del contatore redis_write")
+                print("Errore nell'incremento del contatore di errori redis_write")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"❌ Errore: Stai cercando di aggiungere dati a un campo che non è una lista! {e}")
@@ -169,7 +169,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_pubsub")
             except:
-                print("Errore nell'incremento del contatore redis_pubsub")
+                print("Errore nell'incremento del contatore di errori redis_pubsub")
                 pass
             print(f"❌ Errore Pub/Sub (Publish) su {channel}: {e}")
             return 0
@@ -208,7 +208,7 @@ class RedisClient:
                         try:
                             self.client.incr("errors:counter:redis_pubsub")
                         except:
-                            print("Errore nell'incremento del contatore redis_pubsub")
+                            print("Errore nell'incremento del contatore di errori redis_pubsub")
                             pass
                         print(f"❌ Errore nel thread in ascolto su {channel}: {e}")
                         time.sleep(2.5) # Evita il surriscaldamento della CPU in caso di riavvio
@@ -219,7 +219,7 @@ class RedisClient:
                 try:
                     self.client.incr("errors:counter:redis_pubsub")
                 except:
-                    print("Errore nell'incremento del contatore redis_pubsub")
+                    print("Errore nell'incremento del contatore di errori redis_pubsub")
                     pass
                 print(f"❌ Errore critico inibizione Pub/Sub {channel}: {outer_e}")
             finally:
@@ -293,7 +293,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_write")
             except Exception:
-                print("Errore nell'incremento del contatore redis_write")
+                print("Errore nell'incremento del contatore di errori redis_write")
                 pass # Evita che un problema di rete nel log generi un crash a catena
                 
             print(f"❌ Errore Stream XADD su {stream_name}: {e}")
@@ -320,7 +320,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_read")
             except Exception:
-                print("Errore nell'incremento del contatore redis_read")
+                print("Errore nell'incremento del contatore di errori redis_read")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore lettura stream {stream_name}: {e}")
@@ -347,12 +347,13 @@ class RedisClient:
             if "already exists" not in str(e):
                 print(f"❌ Errore creazione gruppo: {e}")
             
-            # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
-            try:
-                self.client.incr("errors:counter:redis_admin")
-            except Exception:
-                print("Errore nell'incremento del contatore redis_admin")
-                pass # Evita che un problema di rete nel log generi un crash a catena
+                # PREDISPOSIZIONE MONITORAGGIO: Incrementiamo un contatore centralizzato su Redis
+                # Incrementiamo il contatore SOLO se è un VERO errore operativo
+                try:
+                    self.client.incr("errors:counter:redis_admin")
+                except Exception:
+                    print("Errore nell'incremento del contatore di errori redis_admin")
+                    pass # Evita che un problema di rete nel log generi un crash a catena
 
 
     def read_group(self, stream_name: str, group_name: str, consumer_name: str, last_id: str = '>', count: int = 1, block: int = 0) -> list[Any]:
@@ -389,7 +390,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_read")
             except Exception:
-                print("Errore nell'incremento del contatore redis_read")
+                print("Errore nell'incremento del contatore di errori redis_read")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore lettura gruppo {group_name}: {e}")
@@ -416,7 +417,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_admin")
             except Exception:
-                print("Errore nell'incremento del contatore redis_admin")
+                print("Errore nell'incremento del contatore di errori redis_admin")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"❌ Errore XACK per ID {message_id}: {e}")
@@ -462,7 +463,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_admin")
             except Exception:
-                print("Errore nell'incremento del contatore redis_admin")
+                print("Errore nell'incremento del contatore di errori redis_admin")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore durante l'interrogazione XPENDING su {stream}: {e}")
@@ -504,7 +505,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_read")
             except Exception:
-                print("Errore nell'incremento del contatore redis_read")
+                print("Errore nell'incremento del contatore di errori redis_read")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore nel recupero puntuale del messaggio {msg_id}: {e}")
@@ -553,7 +554,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_admin")
             except Exception:
-                print("Errore nell'incremento del contatore redis_admin")
+                print("Errore nell'incremento del contatore di errori redis_admin")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore durante l'XAUTOCLAIM sullo stream {stream_name}: {e}")
@@ -586,7 +587,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_write")
             except Exception:
-                print("Errore nell'incremento del contatore redis_write")
+                print("Errore nell'incremento del contatore di errori redis_write")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"❌ Errore Redis Hash HSET su {key}: {e}")
@@ -614,7 +615,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_read")
             except Exception:
-                print("Errore nell'incremento del contatore redis_read")
+                print("Errore nell'incremento del contatore di errori redis_read")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore lettura Hash HGETALL su {key}: {e}")
@@ -642,7 +643,7 @@ class RedisClient:
             try:
                 self.client.incr("errors:counter:redis_read")
             except Exception:
-                print("Errore nell'incremento del contatore redis_read")
+                print("Errore nell'incremento del contatore di errori redis_read")
                 pass # Evita che un problema di rete nel log generi un crash a catena
 
             print(f"⚠️ Errore lettura campo Hash HGET su {key}:{field}: {e}")
