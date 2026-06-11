@@ -173,3 +173,105 @@ L'architettura di streaming è stata validata con successo superando uno stress 
     Chaos Test: Interruzione brutale tramite SIGKILL di un worker a metà elaborazione, lasciando messaggi orfani nella sua PEL.
 
     Esito: I restanti due worker superstiti, superata la finestra temporale combinata (Attesa loop + Lock di Idle di Redis), hanno recuperato i messaggi pendenti tramite la logica di autoclaim. Il report di ispezione finale ha confermato l'azzeramento delle PEL e il corretto isolamento dei soli messaggi volutamente difettosi nella Dead Letter Queue.
+
+---
+# 06/06/2026 📌 Punti fondamentali della programmazione asincrona (invariati)
+
+1. **L’event loop è l’orchestratore centrale** – un singolo thread esegue le coroutine, passando da una all’altra quando incontrano `await`.  
+2. **`async def`** definisce una coroutine che può essere sospesa e ripresa.  
+3. **`await`** sospende la coroutine corrente finché l’oggetto attendibile (coroutine, Task, Future) non è completato. **Non blocca il thread** – cede il controllo all’event loop.
+4. **`asyncio.gather()`** esegue più coroutine in concorrenza e attende che tutte finiscano.
+5. **`async with`** gestisce contesti asincroni: crea l’oggetto in modo sincrono, poi chiama `__aenter__` (coroutine) e `__aexit__` (coroutine).
+6. **`asyncio.sleep(1)`** cede il controllo per un tempo determinato, evitando tight loop (CPU al 100%).
+7. **I Task** (`create_task()`) sono coroutine avvolte che girano in background gestite dall’event loop.  
+8. **Il kernel (epoll, kqueue, IOCP)** sblocca le attese di I/O – l’event loop si addormenta e viene svegliato dal sistema operativo quando i dati sono pronti o un timer scade.
+9. **Graceful shutdown**: catturare `CancelledError` e usare `try/finally` o `async with` per rilasciare le risorse.
+
+---
+
+## 🔁 Flusso dettagliato del `BaseIngestionWorker` aggiornato
+
+### 1. Inizializzazione (`__init__`)
+- Stessa versione: salva `symbol`, `timeframe`, calcola `redis_stream`, imposta `redis = None` e `running = True`.
+
+### 2. Avvio (`asyncio.run(worker.run())`)
+- L’event loop esegue la coroutine `run()`.
+
+### 3. Dentro `run()`
+
+#### 3a. Connessione a Redis
+- `self.redis = redis.Redis(...)` – crea il client asincrono (la connessione fisica avviene alla prima operazione).
+
+#### 3b. Warm‑up storico (`await self._warmup_storico()`)
+**Novità**: ora interroga Redis per evitare duplicati e riempire il gap.
+- Chiama `await self._get_last_redis_timestamp()`:
+  - Usa `xrevrange` con `count=1` per ottenere l’ultima candela nello stream.
+  - Restituisce il timestamp (intero) o `None` se lo stream è vuoto.
+- Se `last_ts` esiste, chiama `await self.fetch_historic_klines(since_timestamp=last_ts, limit=200)` – scarica **solo le candele più recenti** a partire da quel timestamp (gap filling).
+- Se `last_ts` è `None`, chiama `await self.fetch_historic_klines(limit=200)` – scarica le ultime 200 candele.
+- Cicla sulle candele recuperate e **scarta quelle con timestamp ≤ last_ts** (evita duplicati).
+- Per ogni candela nuova: `await self.push_to_redis(kline)`.
+  - **Nota**: `push_to_redis` ora **non ha try/except** – se Redis fallisce, l’eccezione si propaga verso l’alto (terminando il warm‑up e poi il loop live).
+
+#### 3c. Loop live del WebSocket
+```python
+while self.running:
+    try:
+        await self.listen_websocket_stream()
+        await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        self.running = False
+        break
+    except Exception as e:
+        print(f"Connessione interrotta (WS o Redis): {e}. Riconnessione tra 5s...")
+        await asyncio.sleep(5)
+```
+- **`await self.listen_websocket_stream()`** – metodo concreto che si connette al WebSocket e, per ogni candela chiusa, chiama `push_to_redis()`.
+- Se il WebSocket cade o se `push_to_redis()` solleva un’eccezione (es. Redis offline), l’eccezione viene catturata, si attende 5 secondi e poi si riprova a chiamare `listen_websocket_stream()` (che ristabilirà anche la connessione a Redis? No – Redis è già connesso, ma se Redis è andato giù, la prossima `push_to_redis` fallirà di nuovo. In ogni caso il loop continua a tentare).
+- `CancelledError` esce dal loop.
+
+#### 3d. Cleanup (`finally`)
+- `await self.redis.close()` – chiude la connessione Redis in modo pulito.
+
+### 4. Shutdown
+- Ctrl+C → `CancelledError` → worker esce dal loop, chiude Redis, termina l’event loop.
+
+---
+
+## 🔄 Differenze principali rispetto alla versione precedente (da ricordare)
+
+| Aspetto | Versione originale | Versione aggiornata |
+|---------|-------------------|---------------------|
+| Warm‑up | Scarica sempre 200 candele, senza controlli | Legge l’ultimo timestamp da Redis e fa gap filling (evita buchi e duplicati) |
+| Gestione errori Redis in `push_to_redis` | `try/except` interno – silenzia l’errore | **Nessun** `try/except` – l’errore si propaga e fa riavviare il loop WebSocket |
+| `fetch_historic_klines` | Solo parametro `limit` | Ora ha anche `since_timestamp` (opzionale) per scaricare da un momento specifico |
+| Resilienza | Errore Redis non interrompeva il worker | Qualsiasi errore Redis (o WebSocket) causa una riconnessione completa dopo 5s |
+
+---
+
+## 🧠 Schema riassuntivo aggiornato
+
+```
+asyncio.run(worker.run())
+    │
+    ├─> self.redis = redis.Redis(...)
+    │
+    ├─> await self._warmup_storico()
+    │       ├─> last_ts = await self._get_last_redis_timestamp()
+    │       ├─> if last_ts: historical = await self.fetch_historic_klines(since_timestamp=last_ts)
+    │       │   else: historical = await self.fetch_historic_klines(limit=200)
+    │       └─> per kline in historical: if kline["timestamp"] > last_ts: await self.push_to_redis(kline)
+    │
+    └─> while self.running:
+            try:
+                await self.listen_websocket_stream()   # contiene push_to_redis (senza try)
+                await asyncio.sleep(1)
+            except CancelledError:
+                self.running = False
+            except Exception as e:
+                await asyncio.sleep(5)   # riconnessione
+    │
+    └─> await self.redis.close()
+```
+
+---
