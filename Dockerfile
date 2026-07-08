@@ -21,6 +21,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
     pip install -r requirements.txt
 
+# 4.5 INIEZIONE AUTOMATICA SDK BITGET (Risolve l'assenza di setup.py a monte)
+# Cloniamo il repo ufficiale, copiamo la cartella core nei site-packages globali e puliamo la cache temporanea.
+RUN git clone https://github.com/BitgetLimited/v3-bitget-api-sdk.git /tmp/bitget-sdk && \
+    cp -r /tmp/bitget-sdk/bitget-python-sdk-api/bitget /usr/local/lib/python3.11/site-packages/ && \
+    rm -rf /tmp/bitget-sdk
+
 # 5. Copia del codice
 COPY . .
 
