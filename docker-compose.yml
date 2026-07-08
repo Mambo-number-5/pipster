@@ -6,7 +6,6 @@ services:
     #command: redis-server --save 60 1 --loglevel warning
     ports:
       - "6379:6379"
-      - "8001:8001" # OPZIONALE: apre la dashboard grafica di RedisInsight
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -16,6 +15,26 @@ services:
       timeout: 3s
       retries: 5
 
+  ingestion:
+    profiles: ["ingest"]
+    build: .
+    image: pipster
+    container_name: pipster_ingestion
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - ./historical_data:/app/historical_data
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PYTHONUNBUFFERED=1
+      - HOME=/tmp
+    command: python bitget_ingestion.py
+    restart: unless-stopped
   bot:
     build: .
     image: pipster
@@ -33,7 +52,7 @@ services:
       - REDIS_PORT=6379
       - PYDEVD_DISABLE_FILE_VALIDATION=1  # Toglie il warning del debugger
       - PYTHONUNBUFFERED=1                # Log in tempo reale, vedi i print mano a mano che compaiono
-    # Comando standard: avvia il bot normalmente
+      - HOME=/tmp
     command: python main.py
     restart: unless-stopped
 
