@@ -8,7 +8,7 @@ os.environ["REDIS_DB"] = "15"
 # 2. SISTEMAZIONE PATH PER GLI IMPORT LOCALI
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bitget_ingestion import BitgetIngestionWorker
+from exchanges.bitget.ingestion import BitgetIngestionWorker
 
 async def main():
     # Estrazione parametri direttamente dall'ambiente (già popolato da Docker Compose)

@@ -3,7 +3,7 @@ import sys
 import json
 import asyncio
 from typing import cast
-from base_ingestion import BaseIngestionWorker
+from core.base_ingestion import BaseIngestionWorker
 
 from bitget.ws.bitget_ws_client import BitgetWsClient, SubscribeReq
 
