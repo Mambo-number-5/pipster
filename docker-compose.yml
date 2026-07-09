@@ -17,7 +17,9 @@ services:
 
   ingestion:
     profiles: ["ingest"]
-    build: .
+    build:
+      context: .
+      dockerfile: docker/bot.Dockerfile
     image: pipster
     container_name: pipster_ingestion
     depends_on:
@@ -25,7 +27,7 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-      - ./historical_data:/app/historical_data
+      - ./data/historical_data:/app/data/historical_data
     env_file:
       - .env
     environment:
@@ -36,7 +38,9 @@ services:
     command: python bitget_ingestion.py
     restart: unless-stopped
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/bot.Dockerfile
     image: pipster
     container_name: pipster_bot
     depends_on:
@@ -44,7 +48,7 @@ services:
         condition: service_healthy # Il bot parte solo quando il ping di redis risponde
     volumes:
       - .:/app
-      - ./historical_data:/app/historical_data
+      - ./data/historical_data:/app/data/historical_data
     env_file:
       - .env
     environment:

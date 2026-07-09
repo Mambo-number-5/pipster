@@ -2,8 +2,8 @@ import time
 import threading
 import os
 import signal
-from redis_client import RedisClient
-from worker import TradingWorker
+from core.redis_client import RedisClient
+from core.worker import TradingWorker
 
 # Forza il client a usare il DB 15 per i test
 os.environ["REDIS_DB"] = "15"

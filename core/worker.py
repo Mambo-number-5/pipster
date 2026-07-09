@@ -1,8 +1,8 @@
 import time
 import signal
 import json
-from typing import Callable, Optional
-from redis_client import RedisClient  
+from typing import Callable
+from core.redis_client import RedisClient
 
 class TradingWorker:
     """
