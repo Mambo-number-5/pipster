@@ -23,5 +23,6 @@ venv/
 README.md
 docs/
 tests/
-reports/
+data/reports/
 plots/
+data/historical_data/

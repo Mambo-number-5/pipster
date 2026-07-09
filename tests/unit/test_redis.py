@@ -1,15 +1,11 @@
 import unittest
 import time
 import os
-import sys
+from core.redis_client import RedisClient
 
 # Forza l'uso del DB 15 per i test prima ancora di importare o istanziare il client
 os.environ["REDIS_DB"] = "15"
 
-# Aggiungiamo la cartella principale al path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from redis_client import RedisClient
 
 class TestRedisProfessional(unittest.TestCase):
 

@@ -1,5 +1,5 @@
 import pandas as pd
-from indicators import ema, atr, rsi
+from core.indicators import ema, atr, rsi
 
 def generate_signals(df, timeframe, params):
     p = params[timeframe]

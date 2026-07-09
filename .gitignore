@@ -23,5 +23,5 @@ build/
 *.db
 *.csv
 plots/
-reports/
-historical_data/
+data/reports/
+data/historical_data/
