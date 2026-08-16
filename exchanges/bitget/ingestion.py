@@ -7,28 +7,6 @@ from core.base_ingestion import BaseIngestionWorker
 
 from bitget.ws.bitget_ws_client import BitgetWsClient, SubscribeReq
 
-class BitgetWsSubscribeRequest:
-    """Richiesta di sottoscrizione compatibile con BitgetWsClient.
-
-    Utilizza i nomi dei campi ufficiali (instType, instId, channel) e
-    implementa __hash__ e __eq__ per essere usata come chiave nella mappa
-    interna dei listener.
-    """
-    def __init__(self, instType: str, channel: str, instId: str):
-        self.instType = instType
-        self.channel = channel
-        self.instId = instId
-
-    def __hash__(self):
-        return hash(self.instType + self.channel + self.instId)
-
-    def __eq__(self, other):
-        if isinstance(other, BitgetWsSubscribeRequest):
-            return (self.instType == other.instType and
-                    self.channel == other.channel and
-                    self.instId == other.instId)
-        return False
-
 
 class BitgetIngestionWorker(BaseIngestionWorker):
 
