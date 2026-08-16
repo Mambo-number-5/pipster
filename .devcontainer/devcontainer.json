@@ -28,7 +28,7 @@
                 "editor.formatOnSave": true
             }
         }
-    },
+    }
     // "remoteUser": "root" rimosso. 
     // Ora VS Code userà l'utente 1000:1000 passato dall'override e installerà l'estensione server in /tmp
 }
