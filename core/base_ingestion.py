@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
+import logging
 import asyncio
 import redis.asyncio as redis
+from core.rate_limiter import RedisTokenBucket
+
+logger = logging.getLogger(__name__)
 
 class BaseIngestionWorker(ABC):
     """Classe base astratta per l'ingestione dei dati di mercato (Ingestion Engine).
@@ -32,6 +36,7 @@ class BaseIngestionWorker(ABC):
         self.redis_db = redis_db
         self.redis = None  
         self.running = True
+        self.limiter = None  # verrà creato in run()
 
     @abstractmethod
     async def fetch_historic_klines(self, since_timestamp: int | None = None, limit: int = 200) -> list[dict]:
@@ -83,7 +88,7 @@ class BaseIngestionWorker(ABC):
                 return int(fields.get("timestamp", 0))
             return None
         except Exception as e:
-            print(f"⚠️ Impossibile leggere lo stato precedente da Redis: {e}")
+            logger.warning(f"⚠️ Impossibile leggere lo stato precedente da Redis: {e}")
             return None
 
     async def push_to_redis(self, standardized_kline: dict):
@@ -124,15 +129,19 @@ class BaseIngestionWorker(ABC):
         e lo spinge su Redis prima dell'attivazione del flusso in tempo reale. In caso di fallimento,
         permette l'avvio degradato basato solo sul flusso live.
         """
-        print(f"🔥 [WARM-UP] Verifica stato per {self.symbol} ({self.timeframe})...")
+        logger.info(f"🔥 [WARM-UP] Verifica stato per {self.symbol} ({self.timeframe})...")
         try:
             last_ts = await self._get_last_redis_timestamp()
             
+            # Acquisisci un token prima della chiamata REST
+            if self.limiter:
+                await self.limiter.acquire(requested=1)
+
             if last_ts:
-                print(f"🔄 Ultimo dato in DB: {last_ts}. Scarico il gap mancante...")
+                logger.info(f"🔄 Ultimo dato in DB: {last_ts}. Scarico il gap mancante...")
                 historical_data = await self.fetch_historic_klines(since_timestamp=last_ts)
             else:
-                print(f"🆕 Nessun dato pregresso. Scarico storico base...")
+                logger.info(f"🆕 Nessun dato pregresso. Scarico storico base...")
                 historical_data = await self.fetch_historic_klines(limit=200)
 
             # Filtriamo eventuali candele già presenti (stesso o vecchio timestamp)
@@ -142,10 +151,10 @@ class BaseIngestionWorker(ABC):
                     await self.push_to_redis(kline)
                     new_candles += 1
                     
-            print(f"✅ [WARM-UP] Sincronizzazione completata: {new_candles} nuove candele aggiunte.")
+            logger.info(f"✅ [WARM-UP] Sincronizzazione completata: {new_candles} nuove candele aggiunte.")
             
         except Exception as e:
-            print(f"⚠️ Errore durante il warm-up storico: {e}")
+            logger.warning(f"⚠️ Errore durante il warm-up storico: {e}")
 
     async def run(self):
         """Orchestra l'intero ciclo di vita del processo di ingestione.
@@ -157,23 +166,35 @@ class BaseIngestionWorker(ABC):
         """
 
         self.redis = redis.Redis(host=self.redis_host, port=self.redis_port, db=self.redis_db, decode_responses=True)
+        
+        # Configura il rate limiter per le API REST di Bitget
+        rate = float(os.getenv("BITGET_RATE_LIMIT", "10"))          # token al secondo
+        capacity = int(os.getenv("BITGET_RATE_LIMIT_BURST", "20"))   # burst massimo
+        limiter_key = os.getenv("BITGET_RATE_LIMIT_KEY", "bitget_rest")  # chiave condivisa da tutti i worker
+        self.limiter = RedisTokenBucket(
+            redis_client=self.redis,
+            key=limiter_key,
+            rate=rate,
+            capacity=capacity
+        )
+        
         try:
             await self._warmup_storico()
             
-            print(f"⚡ [LIVE] Avvio ascolto WebSocket in tempo reale...")
+            logger.info(f"⚡ [LIVE] Avvio ascolto WebSocket in tempo reale...")
             while self.running:
                 try:
                     await self.listen_websocket_stream()
                     await asyncio.sleep(1) 
                 except asyncio.CancelledError:
-                    print("🛑 [INTERRUPT] Segnale di stop ricevuto. Uscita...")
+                    logger.info("🛑 [INTERRUPT] Segnale di stop ricevuto. Uscita...")
                     self.running = False
                     break
                 except Exception as e:
                     # ORA anche gli errori di Redis finiranno qui!
-                    print(f"💥 Connessione interrotta (WS o Redis): {e}. Riconnessione tra 5s...")
+                    logger.error(f"💥 Connessione interrotta (WS o Redis): {e}. Riconnessione tra 5s...")
                     await asyncio.sleep(5)
         finally:
-            print("🛑 [SHUTDOWN] Chiusura connessione Redis...")
+            logger.info("🛑 [SHUTDOWN] Chiusura connessione Redis...")
             if self.redis:
                 await self.redis.close()
