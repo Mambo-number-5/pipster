@@ -5,6 +5,7 @@ import asyncio
 import logging
 from typing import cast
 from core.base_ingestion import BaseIngestionWorker
+from core.utils import retry_async
 
 from bitget.ws.bitget_ws_client import BitgetWsClient, SubscribeReq
 
@@ -123,7 +124,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                 "endTime": end_time,
                 "limit": str(limit)
             }
-        logger.debug("DEBUG - parametri REST:", parameters)
+        logger.debug("DEBUG - parametri REST: %s", parameters)
         return cast(dict, self.market_client.candles(params=parameters))
 
     async def fetch_historic_klines(self, since_timestamp: int | None = None, limit: int = 200) -> list[dict]:
@@ -149,15 +150,10 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                     "volume": float
                 }
         """
-        try:
-            # MODIFICA: timeout di 30 secondi per la chiamata sincrona in thread
-            response = await asyncio.wait_for(
-                asyncio.to_thread(self._sync_fetch_klines, since_timestamp, limit),
-                timeout=30
+        # MODIFICA: timeout di 30 secondi per la chiamata sincrona in thread
+        response = await retry_async(lambda: asyncio.wait_for(
+            asyncio.to_thread(self._sync_fetch_klines, since_timestamp, limit), timeout=30)
             )
-        except asyncio.TimeoutError:
-            logger.warning("⏱️ Timeout durante il recupero storico. Nessun dato importato.")
-            return []
         
         standardized_data = []
         # MODIFICA: verifica esplicita del codice di successo
@@ -173,7 +169,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                 })
             standardized_data.sort(key=lambda x: x["timestamp"])
         else:
-            logger.warning(f"⚠️ Risposta API inattesa o errore: {response.get('msg', response)}")
+            logger.warning("⚠️ Risposta API inattesa o errore: %s", response.get('msg', response))
         
         return standardized_data
 
@@ -190,7 +186,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         if self._ws_stopping:
             return
         # AGGIUNGI QUESTO PRINT DI DIAGNOSTICA:
-        logger.debug("🔴 [WS RAW RECEIVE]:", message)
+        logger.debug("🔴 [WS RAW RECEIVE]: %s", message)
         if message and "data" in message and self.loop is not None:
             asyncio.run_coroutine_threadsafe(self.ws_queue.put(message), self.loop)
 
@@ -200,7 +196,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         Args:
             error (Exception/str): L'eccezione o il messaggio d'errore intercettato dal socket.
         """
-        logger.warning(f"⚠️ [Bitget WS Error]: {error}")
+        logger.warning("⚠️ [Bitget WS Error]: %s", error)
 
     def _get_ws_channel_and_granularity(self) -> tuple[str, str]:
         """Calcola la granularità e il nome del canale WebSocket secondo la documentazione ufficiale.
@@ -256,7 +252,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         ws_client.build()
         ws_client.subscribe([req], self._ws_callback)
         
-        logger.info(f"🔌 [BITGET] Connessione al WebSocket (Canale: {channel_name})...")
+        logger.info("🔌 [BITGET] Connessione al WebSocket (Canale: %s)...", channel_name)
 
         try:
             while self.running:
