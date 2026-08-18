@@ -129,7 +129,7 @@ class BaseIngestionWorker(ABC):
         e lo spinge su Redis prima dell'attivazione del flusso in tempo reale. In caso di fallimento,
         permette l'avvio degradato basato solo sul flusso live.
         """
-        logger.info(f"🔥 [WARM-UP] Verifica stato per {self.symbol} ({self.timeframe})...")
+        logger.info("🔥 [WARM-UP] Verifica stato per %s (%s)...", self.symbol, self.timeframe)
         try:
             last_ts = await self._get_last_redis_timestamp()
             
@@ -138,10 +138,10 @@ class BaseIngestionWorker(ABC):
                 await self.limiter.acquire(requested=1)
 
             if last_ts:
-                logger.info(f"🔄 Ultimo dato in DB: {last_ts}. Scarico il gap mancante...")
+                logger.info("🔄 Ultimo dato in DB: %s. Scarico il gap mancante...", last_ts)
                 historical_data = await self.fetch_historic_klines(since_timestamp=last_ts)
             else:
-                logger.info(f"🆕 Nessun dato pregresso. Scarico storico base...")
+                logger.info("🆕 Nessun dato pregresso. Scarico storico base...")
                 historical_data = await self.fetch_historic_klines(limit=200)
 
             # Filtriamo eventuali candele già presenti (stesso o vecchio timestamp)
@@ -151,10 +151,10 @@ class BaseIngestionWorker(ABC):
                     await self.push_to_redis(kline)
                     new_candles += 1
                     
-            logger.info(f"✅ [WARM-UP] Sincronizzazione completata: {new_candles} nuove candele aggiunte.")
+            logger.info("✅ [WARM-UP] Sincronizzazione completata: %s nuove candele aggiunte.", new_candles)
             
         except Exception as e:
-            logger.warning(f"⚠️ Errore durante il warm-up storico: {e}")
+            logger.warning("⚠️ Errore durante il warm-up storico: %s", e)
 
     async def run(self):
         """Orchestra l'intero ciclo di vita del processo di ingestione.
@@ -178,6 +178,8 @@ class BaseIngestionWorker(ABC):
             capacity=capacity
         )
         
+        backoff = 1  # secondi iniziali
+        max_backoff = 150  # massimo 150s
         try:
             await self._warmup_storico()
             
@@ -185,15 +187,22 @@ class BaseIngestionWorker(ABC):
             while self.running:
                 try:
                     await self.listen_websocket_stream()
-                    await asyncio.sleep(1) 
+                    # Se il listener termina senza errori (caso raro), resetta il backoff
+                    backoff = 1
+                    await asyncio.sleep(1)
+
                 except asyncio.CancelledError:
                     logger.info("🛑 [INTERRUPT] Segnale di stop ricevuto. Uscita...")
                     self.running = False
                     break
                 except Exception as e:
-                    # ORA anche gli errori di Redis finiranno qui!
-                    logger.error(f"💥 Connessione interrotta (WS o Redis): {e}. Riconnessione tra 5s...")
-                    await asyncio.sleep(5)
+                    # Calcola attesa con jitter (es. backoff + random 0-30% del backoff)
+                    jitter = random.uniform(0, 0.3 * backoff)
+                    wait_time = backoff + jitter
+                    logger.error("💥 Connessione interrotta: %s. Riconnessione tra %.2fs...", e, wait_time, exc_info=True)
+                    await asyncio.sleep(wait_time)
+                    # Raddoppia il backoff fino al massimo
+                    backoff = min(backoff * 2, max_backoff)
         finally:
             logger.info("🛑 [SHUTDOWN] Chiusura connessione Redis...")
             if self.redis:
