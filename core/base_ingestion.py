@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 import logging
 import asyncio
 import redis.asyncio as redis
+from redis.exceptions import ConnectionError, ResponseError
+from utils import timeframe_to_ms
 from core.rate_limiter import RedisTokenBucket
 
 logger = logging.getLogger(__name__)
@@ -18,19 +20,39 @@ class BaseIngestionWorker(ABC):
         Attributes:
             symbol (str): Il simbolo di mercato da tracciare (es. "BTCUSDT").
             timeframe (str): Il time-frame delle candele (es. "15m", "1h").
-            redis_stream (str): Il nome univoco dello stream Redis calcolato per simbolo e timeframe.
+            market_type (str): Il tipo di mercato ("spot", "futures").
+            tf_ms (int): Durata del timeframe precomputata in millisecondi.
+            redis_stream (str): Il nome dello stream Redis per le candele storicizzate (`stream:market:type:symbol:tf`).
+            redis_live_key (str): La chiave Hash Redis per il tracciamento della candela in corso (`live:market:type:symbol:tf`).
             redis_host (str): Indirizzo host del server Redis.
             redis_port (int): Porta di ascolto del server Redis.
-            readus_db (int): Numero du database redus usato
+            redis_db (int): Numero del database Redis usato.
             redis (redis.Redis | None): Istanza del client Redis asincrono, inizializzata in `run()`.
             running (bool): Flag di controllo per il ciclo di vita del WebSocket live.
+            limiter (RedisTokenBucket | None): Istanza del rate limiter per le chiamate REST.
+            last_saved_timestamp (int): Timestamp in ms dell'ultima candela chiusa salvata in memoria per la riconciliazione rapida.
     """
 
-    def __init__(self, symbol: str, timeframe: str, redis_host: str = "localhost", redis_port: int = 6379, redis_db = 0):
-        """Inizializza i parametri di configurazione del worker di ingestione."""
+    def __init__(self, symbol: str, timeframe: str, market_type: str = "spot", redis_host: str = "localhost", redis_port: int = 6379, redis_db = 0):
+        """Inizializza i parametri di configurazione del worker di ingestione e lo stato di riconciliazione.
+        Args:
+            symbol (str): Il simbolo di mercato da tracciare (es. "BTCUSDT").
+            timeframe (str): Il time-frame delle candele (es. "15m", "1h").
+            market_type (str, optional): Il tipo di mercato ("spot", "futures"). Defaults to "spot".
+            redis_host (str, optional): Indirizzo host del server Redis. Defaults to "localhost".
+            redis_port (int, optional): Porta di ascolto del server Redis. Defaults to 6379.
+            redis_db (int, optional): Numero del database Redis usato. Defaults to 0.
+        """
         self.symbol = symbol.upper()
         self.timeframe = timeframe
-        self.redis_stream = f"stream:market:{self.symbol}:{self.timeframe}"
+
+        self.tf_ms = timeframe_to_ms(timeframe) # Calcolo precomputato per verifiche
+        self.market_type = market_type.lower()  # "spot", "futures", "linear", ecc.
+
+        self.redis_stream = f"stream:market:{self.market_type}:{self.symbol}:{self.timeframe}"
+        # Nuova chiave per candele live
+        self.redis_live_key = f"live:market:{self.market_type}:{self.symbol}:{self.timeframe}"
+
         self.redis_host = redis_host
         self.redis_port = redis_port
         self.redis_db = redis_db
@@ -38,14 +60,18 @@ class BaseIngestionWorker(ABC):
         self.running = True
         self.limiter = None  # verrà creato in run()
 
+        # Stato in memoria vitale per la riconciliazione rapida
+        self.last_saved_timestamp: int = 0
+
     @abstractmethod
     async def fetch_historic_klines(self, since_timestamp: int | None = None, limit: int = 200) -> list[dict]:
         """Scarica le candele storiche (Kline/Candlestick) tramite chiamate REST.
 
         Questo metodo deve essere implementato dal connettore specifico del broker.
-        Viene invocato durante la fase di warm-up per garantire la continuità degli indicatori.
+        Viene invocato durante la fase di warm-up e per il riempimento dei gap (gap filling).
 
         Args:
+            since_timestamp (int | None, optional): Timestamp Unix in ms da cui iniziare lo scarico.
             limit (int): Il numero massimo di candele storiche da recuperare.
 
         Returns:
@@ -58,7 +84,8 @@ class BaseIngestionWorker(ABC):
                         "high": float | str,
                         "low": float | str,
                         "close": float | str,
-                        "volume": float | str
+                        "volume": float | str,
+                        "is_closed": bool  # True per candele storiche, False se la candela sta ancora formandosi
                     }
         """
         pass
@@ -92,35 +119,119 @@ class BaseIngestionWorker(ABC):
             return None
 
     async def push_to_redis(self, standardized_kline: dict):
-        """Inietta una candela normalizzata all'interno dello stream Redis dedicato.
+        """Inietta una candela normalizzata e CHIUSA all'interno dello stream Redis dedicato.
 
+        Forza l'ID del messaggio su Redis usando il timestamp della candela (formato `{timestamp}-0`).
+        Questo garantisce a livello di database l'ordinamento cronologico rigoroso ed evita
+        la scrittura di candele duplicate o fuori ordine.
+        
         Esegue il cast preventivo a stringa di tutti i valori numerici per garantire
         la compatibilità nativa con i Redis Streams ed evita sovrascritture incontrollate
         grazie alla separazione degli stream per simbolo.
 
         Args:
-            standardized_kline (dict): Dizionario contenente i dati strutturati della candela
-                (timestamp, open, high, low, close, volume).
+            standardized_kline (dict): Dizionario della candela normalizzata da salvare nello stream.
+                (timestamp, open, high, low, close, volume, is_closed).
+        
+        Raises:
+            ConnectionError: Se la connessione Redis non è stata inizializzata.
+            redis.exceptions.ResponseError: Se si verifica un errore Redis diverso dal rifiuto
+                di ID non progressivi/duplicati.
         """
         if not self.redis:
             raise ConnectionError("Connessione Redis non inizializzata.")
         
-        # Niente try/except qui. Se Redis crasha, vogliamo che l'errore propaghi 
-        # verso l'alto per chiudere il WebSocket e tentare un riavvio pulito.
-        await self.redis.xadd(
-            name=self.redis_stream,
-            fields={
-                "symbol": self.symbol,
-                "timestamp": str(standardized_kline["timestamp"]),
-                "open": str(standardized_kline["open"]),
-                "high": str(standardized_kline["high"]),
-                "low": str(standardized_kline["low"]),
-                "close": str(standardized_kline["close"]),
-                "volume": str(standardized_kline["volume"])
-            },
-            maxlen=1000,
-            approximate=True
-        )
+        try:
+            # FORZATURA ID: usiamo il timestamp come ID del messaggio (es. "1690000000000-0")
+            # Questo previene NATIVAMENTE inserimenti doppi o fuori ordine.
+            await self.redis.xadd(
+                name=self.redis_stream,
+                fields={
+                    "symbol": self.symbol,
+                    "timestamp": str(standardized_kline["timestamp"]),
+                    "open": str(standardized_kline["open"]),
+                    "high": str(standardized_kline["high"]),
+                    "low": str(standardized_kline["low"]),
+                    "close": str(standardized_kline["close"]),
+                    "volume": str(standardized_kline["volume"]),
+                    "is_closed": str(standardized_kline["is_closed"])
+                },
+                id=f"{ts_str}-0",
+                maxlen=1000,
+                approximate=True
+                )
+        except ResponseError as e:
+            # Se un altro processo o un disallineamento tenta di inserire un ID vecchio/uguale, Redis lo rigetta
+            if "ID specified is equal or smaller" in str(e):
+                logger.debug("Duplicato/Out of order bloccato nativamente da Redis per TS: %s", ts_str)
+            else:
+                raise
+
+    async def process_live_candle(self, kline: dict):
+        """Orchestra la riconciliazione in tempo reale dei dati provenienti dal WebSocket.
+
+        Filtra le candele non ancora chiuse indirizzandole su una chiave Hash volatile (`live:market:...`),
+        scarta duplicati e messaggi arrivati fuori ordine basandosi sullo stato interno `last_saved_timestamp`,
+        e attiva automaticamente il riempimento dei buchi temporali (`_fill_gap`) se rileva un salto cronologico.
+
+        Args:
+            kline (dict): La candela normalizzata ricevuta dal flusso live WebSocket.
+        """
+        ts = int(kline["timestamp"])
+        is_closed = kline.get("is_closed", False)
+
+        # --- PROBLEMA 4: Candele parziali/in corso ---
+        if not is_closed:
+            # Upsert su un Hash Redis: i dati live vengono sovrascritti continuamente
+            # Utile per monitorare il prezzo in tempo reale, ma non sporca lo storico!
+            if self.redis:
+                await self.redis.hset(self.redis_live_key, mapping={k: str(v) for k, v in kline.items()})
+            return
+
+        # Da qui in poi elaboriamo solo candele storicizzate (CHIUSE)
+        
+        if self.last_saved_timestamp == 0:
+            self.last_saved_timestamp = await self._get_last_redis_timestamp() or 0
+
+        # --- PROBLEMI 1, 2 e 5: Duplicati (Handoff & Riconnessioni) e Arrivi fuori ordine ---
+        if ts <= self.last_saved_timestamp:
+            logger.debug("Candela scartata: %s (<= %s)", ts, self.last_saved_timestamp)
+            return
+
+        # --- PROBLEMA 3: Buchi temporali (Gap) ---
+        # Se la distanza tra l'ultima candela e questa supera un timeframe, c'è un buco.
+        if self.last_saved_timestamp > 0 and (ts - self.last_saved_timestamp) > self.tf_ms:
+            logger.warning("Gap temporale rilevato! Da %s a %s. Avvio mini-warmup...", self.last_saved_timestamp, ts)
+            # Sospendiamo un attimo il live processing e andiamo a scaricare i dati mancanti
+            await self._fill_gap(self.last_saved_timestamp, ts)
+
+        # Inserimento sicuro nello stream
+        await self.push_to_redis(kline)
+        self.last_saved_timestamp = ts
+
+    async def _fill_gap(self, from_ts: int, to_ts: int):
+        """Esegue chiamate REST mirate per colmare i buchi temporali (gap) rilevati nel flusso live.
+
+        Scarica lo storico compreso tra `from_ts` e `to_ts`, inserisce le candele mancanti nello stream
+        e aggiorna progressivamente `last_saved_timestamp`.
+
+        Args:
+            from_ts (int): Timestamp (ms) dell'ultima candela salvata con successo.
+            to_ts (int): Timestamp (ms) della candela live appena arrivata che ha generato il gap.
+        """
+        try:
+            if self.limiter: await self.limiter.acquire()
+            gap_data = await self.fetch_historic_klines(since_timestamp=from_ts)
+            
+            for kline in gap_data:
+                k_ts = int(kline["timestamp"])
+                # Assicuriamoci che riempia solo il buco e non sfori nella candela appena arrivata
+                if from_ts < k_ts < to_ts and kline.get("is_closed", True):
+                    await self.push_to_redis(kline)
+                    self.last_saved_timestamp = k_ts
+                    logger.info("Gap colmato: aggiunta candela %s", k_ts)
+        except Exception as e:
+            logger.error("Errore durante il recupero del gap temporale: %s", e)
 
     async def _warmup_storico(self):
         """Esegue la fase di riscaldamento iniziale scaricando i dati passati.
@@ -168,7 +279,7 @@ class BaseIngestionWorker(ABC):
         self.redis = redis.Redis(host=self.redis_host, port=self.redis_port, db=self.redis_db, decode_responses=True)
         
         # Configura il rate limiter per le API REST di Bitget
-        rate = float(os.getenv("BITGET_RATE_LIMIT", "10"))          # token al secondo
+        rate = float(os.getenv("BITGET_RATE_LIMIT", "19"))          # token al secondo
         capacity = int(os.getenv("BITGET_RATE_LIMIT_BURST", "20"))   # burst massimo
         limiter_key = os.getenv("BITGET_RATE_LIMIT_KEY", "bitget_rest")  # chiave condivisa da tutti i worker
         self.limiter = RedisTokenBucket(

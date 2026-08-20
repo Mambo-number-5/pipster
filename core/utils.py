@@ -58,3 +58,10 @@ async def retry_async(
                 delay,
             )
             await asyncio.sleep(delay)
+
+def timeframe_to_ms(timeframe: str) -> int:
+    """Utility per convertire la stringa timeframe in millisecondi (es. '15m' -> 900000)."""
+    unit = timeframe[-1]
+    value = int(timeframe[:-1])
+    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+    return value * multipliers.get(unit) * 1000
