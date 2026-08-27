@@ -16,6 +16,7 @@
         "vscode": {
             "extensions": [
                 "ms-python.python", // Supporto Python
+                "ms-python.debugpy", //  Ora viene richiesta debugpy per il debug remoto
                 "ms-python.vscode-pylance", // Suggerimenti intelligenti (risolve le linee rosse)
                 "njpwerner.autodocstring", // Per documentare la statistica velocemente
                 "ms-azuretools.vscode-docker", // Gestione container da VS Code

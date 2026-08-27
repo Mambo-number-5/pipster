@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
 import logging
 import asyncio
+import random, os
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError, ResponseError
-from utils import timeframe_to_ms
+from core.utils import timeframe_to_ms, retry_async
 from core.rate_limiter import RedisTokenBucket
 
 logger = logging.getLogger(__name__)
@@ -43,22 +44,22 @@ class BaseIngestionWorker(ABC):
             redis_port (int, optional): Porta di ascolto del server Redis. Defaults to 6379.
             redis_db (int, optional): Numero del database Redis usato. Defaults to 0.
         """
-        self.symbol = symbol.upper()
-        self.timeframe = timeframe
+        self.symbol: str = symbol.upper()
+        self.timeframe: str = timeframe
 
-        self.tf_ms = timeframe_to_ms(timeframe) # Calcolo precomputato per verifiche
-        self.market_type = market_type.lower()  # "spot", "futures", "linear", ecc.
+        self.tf_ms: int = timeframe_to_ms(timeframe) # Calcolo precomputato per verifiche
+        self.market_type: str = market_type.lower()  # "spot", "futures", "linear", ecc.
 
-        self.redis_stream = f"stream:market:{self.market_type}:{self.symbol}:{self.timeframe}"
+        self.redis_stream: str = f"stream:market:{self.market_type}:{self.symbol}:{self.timeframe}"
         # Nuova chiave per candele live
-        self.redis_live_key = f"live:market:{self.market_type}:{self.symbol}:{self.timeframe}"
+        self.redis_live_key: str = f"live:market:{self.market_type}:{self.symbol}:{self.timeframe}"
 
-        self.redis_host = redis_host
-        self.redis_port = redis_port
-        self.redis_db = redis_db
-        self.redis = None  
-        self.running = True
-        self.limiter = None  # verrà creato in run()
+        self.redis_host: str = redis_host
+        self.redis_port: int = redis_port
+        self.redis_db: int = redis_db
+        self.redis: redis.Redis | None = None  
+        self.running: bool = True
+        self.limiter: RedisTokenBucket | None = None  # verrà creato in run()
 
         # Stato in memoria vitale per la riconciliazione rapida
         self.last_saved_timestamp: int = 0
@@ -115,10 +116,10 @@ class BaseIngestionWorker(ABC):
                 return int(fields.get("timestamp", 0))
             return None
         except Exception as e:
-            logger.warning(f"⚠️ Impossibile leggere lo stato precedente da Redis: {e}")
+            logger.warning("⚠️ Impossibile leggere lo stato precedente da Redis: %s", e, exc_info=True)
             return None
 
-    async def push_to_redis(self, standardized_kline: dict):
+    async def push_to_redis(self, standardized_kline: dict) -> int:
         """Inietta una candela normalizzata e CHIUSA all'interno dello stream Redis dedicato.
 
         Forza l'ID del messaggio su Redis usando il timestamp della candela (formato `{timestamp}-0`).
@@ -141,20 +142,21 @@ class BaseIngestionWorker(ABC):
         if not self.redis:
             raise ConnectionError("Connessione Redis non inizializzata.")
         
+        ts_str = str(standardized_kline["timestamp"])
         try:
             # FORZATURA ID: usiamo il timestamp come ID del messaggio (es. "1690000000000-0")
             # Questo previene NATIVAMENTE inserimenti doppi o fuori ordine.
             await self.redis.xadd(
-                name=self.redis_stream,
-                fields={
+                    name=self.redis_stream,
+                    fields={
                     "symbol": self.symbol,
-                    "timestamp": str(standardized_kline["timestamp"]),
+                    "timestamp": ts_str,
                     "open": str(standardized_kline["open"]),
                     "high": str(standardized_kline["high"]),
                     "low": str(standardized_kline["low"]),
                     "close": str(standardized_kline["close"]),
                     "volume": str(standardized_kline["volume"]),
-                    "is_closed": str(standardized_kline["is_closed"])
+                    # is_closed NON viene passato a Redis
                 },
                 id=f"{ts_str}-0",
                 maxlen=1000,
@@ -162,12 +164,17 @@ class BaseIngestionWorker(ABC):
                 )
         except ResponseError as e:
             # Se un altro processo o un disallineamento tenta di inserire un ID vecchio/uguale, Redis lo rigetta
-            if "ID specified is equal or smaller" in str(e):
+            if "ID specified is equal or smaller" in str(e) or "ID specified in XADD is equal or smaller" in str(e):
                 logger.debug("Duplicato/Out of order bloccato nativamente da Redis per TS: %s", ts_str)
+                return 0
             else:
                 raise
+        else:
+            logger.debug("Candela salvata nello stream Redis: %s", ts_str)
+            self.last_saved_timestamp = int(ts_str)  # Aggiorniamo lo stato interno per la riconciliazione rapida
+            return 1
 
-    async def process_live_candle(self, kline: dict):
+    async def process_live_candle(self, kline: dict[str, str]):
         """Orchestra la riconciliazione in tempo reale dei dati provenienti dal WebSocket.
 
         Filtra le candele non ancora chiuse indirizzandole su una chiave Hash volatile (`live:market:...`),
@@ -175,7 +182,7 @@ class BaseIngestionWorker(ABC):
         e attiva automaticamente il riempimento dei buchi temporali (`_fill_gap`) se rileva un salto cronologico.
 
         Args:
-            kline (dict): La candela normalizzata ricevuta dal flusso live WebSocket.
+            kline (dict[str, str]): La candela normalizzata ricevuta dal flusso live WebSocket.
         """
         ts = int(kline["timestamp"])
         is_closed = kline.get("is_closed", False)
@@ -203,36 +210,78 @@ class BaseIngestionWorker(ABC):
         if self.last_saved_timestamp > 0 and (ts - self.last_saved_timestamp) > self.tf_ms:
             logger.warning("Gap temporale rilevato! Da %s a %s. Avvio mini-warmup...", self.last_saved_timestamp, ts)
             # Sospendiamo un attimo il live processing e andiamo a scaricare i dati mancanti
-            await self._fill_gap(self.last_saved_timestamp, ts)
+            await self._fill_gap(from_ts=self.last_saved_timestamp, to_ts=ts)
 
         # Inserimento sicuro nello stream
         await self.push_to_redis(kline)
-        self.last_saved_timestamp = ts
 
-    async def _fill_gap(self, from_ts: int, to_ts: int):
-        """Esegue chiamate REST mirate per colmare i buchi temporali (gap) rilevati nel flusso live.
+    async def _fill_gap(self, from_ts: int, to_ts: int | None = None, limit: int = 200) -> int:
+        """Scarica e salva tutte le candele mancanti tra from_ts e to_ts (se dato, altrimenti fino ad ora).
 
-        Scarica lo storico compreso tra `from_ts` e `to_ts`, inserisce le candele mancanti nello stream
-        e aggiorna progressivamente `last_saved_timestamp`.
+        Paginazione, rate limiting e retry automatici inclusi.
+        `push_to_redis` aggiorna `self.last_saved_timestamp` in caso di successo.
 
         Args:
             from_ts (int): Timestamp (ms) dell'ultima candela salvata con successo.
-            to_ts (int): Timestamp (ms) della candela live appena arrivata che ha generato il gap.
-        """
-        try:
-            if self.limiter: await self.limiter.acquire()
-            gap_data = await self.fetch_historic_klines(since_timestamp=from_ts)
-            
-            for kline in gap_data:
-                k_ts = int(kline["timestamp"])
-                # Assicuriamoci che riempia solo il buco e non sfori nella candela appena arrivata
-                if from_ts < k_ts < to_ts and kline.get("is_closed", True):
-                    await self.push_to_redis(kline)
-                    self.last_saved_timestamp = k_ts
-                    logger.info("Gap colmato: aggiunta candela %s", k_ts)
-        except Exception as e:
-            logger.error("Errore durante il recupero del gap temporale: %s", e)
+            to_ts (int | None): Timestamp (ms) fino al quale riempire il gap. Se None, va fino ad ora.
+            limit (int): Numero massimo di candele per singola chiamata REST.
 
+        Returns:
+            int: Numero di candele effettivamente aggiunte allo stream Redis.
+        """
+        current_start = from_ts
+        total_added = 0
+        max_iterations = 100  # salvaguardia contro loop infiniti
+
+        for _ in range(max_iterations):
+            # Rispetta il rate limit prima di ogni chiamata REST
+            if self.limiter:
+                await self.limiter.acquire(requested=1)
+
+            # Esegue la chiamata REST con retry automatico su errori temporanei
+            try:
+                data = await retry_async(
+                    lambda: self.fetch_historic_klines(since_timestamp=current_start, limit=limit),
+                    max_retries=5,
+                    base_delay=1.33,
+                    exceptions=(asyncio.TimeoutError, ConnectionError, OSError)
+                )
+            except Exception as e:
+                logger.error("Errore definitivo durante il fetch storico: %s", e, exc_info=True)
+                break
+
+            if not data:
+                break  # exchange non ha più dati
+
+            # Garantiamo ordine cronologico crescente
+            data.sort(key=lambda x: int(x["timestamp"]))
+
+            for kline in data:
+                k_ts = int(kline["timestamp"])
+
+                # Se è specificato un limite superiore, fermati quando lo raggiungi
+                if to_ts is not None and k_ts >= to_ts:
+                    return total_added  # gap colmato fino alla candela live
+
+                # Evita candele non chiuse o con timestamp già coperto
+                if k_ts <= from_ts or not kline.get("is_closed", True):
+                    continue
+
+                # Salva la candela; push_to_redis ritorna 1 se inserita, 0 se scartata
+                total_added += await self.push_to_redis(kline)
+
+            # Prepara la prossima pagina
+            last_ts = int(data[-1]["timestamp"])
+            if to_ts is not None and last_ts >= to_ts:
+                break
+            if len(data) < limit:
+                break  # ultima pagina
+            current_start = last_ts + 1
+        else:
+            logger.warning("Raggiunto il numero massimo di iterazioni (%d) durante il fill gap.", max_iterations)
+
+        return total_added
+    
     async def _warmup_storico(self):
         """Esegue la fase di riscaldamento iniziale scaricando i dati passati.
 
@@ -243,29 +292,32 @@ class BaseIngestionWorker(ABC):
         logger.info("🔥 [WARM-UP] Verifica stato per %s (%s)...", self.symbol, self.timeframe)
         try:
             last_ts = await self._get_last_redis_timestamp()
-            
-            # Acquisisci un token prima della chiamata REST
-            if self.limiter:
-                await self.limiter.acquire(requested=1)
 
             if last_ts:
                 logger.info("🔄 Ultimo dato in DB: %s. Scarico il gap mancante...", last_ts)
-                historical_data = await self.fetch_historic_klines(since_timestamp=last_ts)
+                added = await self._fill_gap(from_ts=last_ts, to_ts=None)
             else:
                 logger.info("🆕 Nessun dato pregresso. Scarico storico base...")
-                historical_data = await self.fetch_historic_klines(limit=200)
 
-            # Filtriamo eventuali candele già presenti (stesso o vecchio timestamp)
-            new_candles = 0
-            for kline in historical_data:
-                if not last_ts or int(kline["timestamp"]) > last_ts:
-                    await self.push_to_redis(kline)
-                    new_candles += 1
-                    
-            logger.info("✅ [WARM-UP] Sincronizzazione completata: %s nuove candele aggiunte.", new_candles)
-            
+                # Se non c'è storico, partiamo da zero: scarichiamo solo le ultime N candele
+                if self.limiter: await self.limiter.acquire(requested=1)
+                data = await retry_async(
+                    lambda: self.fetch_historic_klines(limit=200),
+                    max_retries=5,
+                    base_delay=1.5,
+                    exceptions=(asyncio.TimeoutError, ConnectionError, OSError)
+                )
+
+                # Garantiamo ordine cronologico crescente
+                data.sort(key=lambda x: int(x["timestamp"]))
+
+                added = 0
+                for kline in data:
+                    if await self.push_to_redis(kline):
+                        added += 1
+            logger.info("✅ [WARM-UP] Sincronizzazione completata: %d nuove candele.", added)
         except Exception as e:
-            logger.warning("⚠️ Errore durante il warm-up storico: %s", e)
+            logger.warning("⚠️ Errore durante il warm-up storico: %s", e, exc_info=True)
 
     async def run(self):
         """Orchestra l'intero ciclo di vita del processo di ingestione.

@@ -64,4 +64,4 @@ def timeframe_to_ms(timeframe: str) -> int:
     unit = timeframe[-1]
     value = int(timeframe[:-1])
     multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-    return value * multipliers.get(unit) * 1000
+    return value * multipliers.get(unit, -1) * 1000
