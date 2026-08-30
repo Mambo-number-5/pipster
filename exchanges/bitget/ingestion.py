@@ -52,6 +52,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         self._ws_stopping = threading.Event()
         self.loop = None
         self._live_candle = None  # Cache dell'ultimo tick ricevuto
+        self.last_server_ts = 0       # ultimo timestamp del server visto nei messaggi WS
 
     def _get_bitget_timeframes(self) -> tuple[str, str]:
         """Unifica e mappa i time-frame per REST API e WebSocket.
@@ -197,6 +198,16 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         """
         logger.warning("⚠️ [Bitget WS Error]: %s", error)
 
+    async def _flush_live_candle_if_expired(self):
+        if self._live_candle is None:
+            return
+        # Usa il timestamp del server se disponibile, altrimenti quello locale
+        now_ms = self.last_server_ts or int(time.time() * 1000)
+        if now_ms >= self._live_candle["timestamp"] + self.tf_ms:
+            self._live_candle["is_closed"] = True
+            await self.process_live_candle(self._live_candle)
+            self._live_candle = None
+
     async def _process_raw_message(self, raw_message: str):
         """Elabora un singolo messaggio grezzo ricevuto dal WebSocket.
 
@@ -210,6 +221,9 @@ class BitgetIngestionWorker(BaseIngestionWorker):
             message = json.loads(raw_message)
             if not isinstance(message, dict) or "data" not in message:
                 return  # non è un messaggio che contiene candele
+            elif "ts" in message:
+                # Aggiorna il timestamp del server visto più recentemente
+                self.last_server_ts = int(message["ts"])
 
             for item in message["data"]:
                 # I campi posizionali seguono l'ordine documentato
@@ -273,19 +287,34 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         logger.info("🔌 [BITGET] Connessione al WebSocket (Canale: %s)...", channel_name)
 
         try:
+            # Timeout breve (es. 5-10s) per fare check periodici senza bloccare il loop
+            CHECK_INTERVAL = 10.0
+            last_msg_time = time.time()
+            is_debugging = sys.gettrace() is not None
+            max_inactivity = 300 if is_debugging else 60
             while self.running:
                 try:
-                    is_debugging = sys.gettrace() is not None
-                    timeout_limit = 300 if is_debugging else 60
-                    raw_message = await asyncio.wait_for(self.ws_queue.get(), timeout=timeout_limit)
-                except asyncio.TimeoutError:
-                    logger.error("⚠️ Nessun dato WebSocket da 60s. Forzo riconnessione.")
-                    raise ConnectionError("WebSocket inattivo")
+                    raw_message = await asyncio.wait_for(self.ws_queue.get(), timeout=CHECK_INTERVAL)
+
+                    # Aggiorna l'orario dell'ultimo messaggio valido ricevuto
+                    last_msg_time = time.time()
+
+                    # Elabora il messaggio
+                    await self._process_raw_message(raw_message)
+
+                    # Garantiamo SEMPRE il task_done() per evitare il blocco della coda
+                    self.ws_queue.task_done()
                 
-                # Elabora il messaggio (la gestione degli errori è dentro l'helper)
-                await self._process_raw_message(raw_message)
-                # Garantiamo SEMPRE il task_done() per evitare il blocco della coda
-                self.ws_queue.task_done()
+                except asyncio.TimeoutError:
+
+                    # Nessun messaggio per CHECK_INTERVAL secondi: controlla se la candela è scaduta
+                    await self._flush_live_candle_if_expired()
+
+                    
+                    # Verifica inattività prolungata per riconnessione
+                    if (time.time() - last_msg_time) > max_inactivity:
+                        logger.error("Nessun dato WebSocket da %ss. Forzo riconnessione.", max_inactivity)
+                    raise ConnectionError("WebSocket inattivo")
                 
         except asyncio.CancelledError:
             logger.info("🛑 Disconnessione WebSocket Bitget in corso...")
@@ -308,6 +337,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                         # elabora raw come fai nel loop principale (estrai candele, chiama process_live_candle)
                         # per evitare duplicazione di codice, estrai una funzione helper
                         await self._process_raw_message(raw)
+                        self.ws_queue.task_done()
                 except asyncio.QueueEmpty:
                     pass
                 except Exception:
