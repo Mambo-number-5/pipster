@@ -611,5 +611,113 @@ subscribe_message = {
 ws_client.send(subscribe_message)
 
 ```
+---
+Ecco le istruzioni pronte da incollare direttamente su `notes.md` con i diversi metodi per ispezionare Redis in ambiente Docker.
 
-Avendo capito questo, la nebbia sull'SDK si dirada: non devi fare altro che comporre dizionari Python che riflettono le richieste HTTP/WS dell'exchange.
+---
+
+# Guida all'Ispezione di Redis in Docker
+
+### Metodo 1: `docker exec` Interattivo (Consigliato)
+
+Accedi direttamente alla CLI di Redis dentro il container Docker in esecuzione.
+
+**1. Shell interattiva su DB 15:**
+
+```bash
+docker exec -it <nome_container_redis> redis-cli -n 15
+
+```
+
+**2. Esecuzione di comandi diretti in riga singola (senza entrare nella shell):**
+
+```bash
+# Leggi l'Hash della candela live
+docker exec -it <nome_container_redis> redis-cli -n 15 HGETALL candle:SPOT:BTCUSDT:1m:live
+
+# Leggi gli ultimi 3 elementi dello Stream delle candele chiuse
+docker exec -it <nome_container_redis> redis-cli -n 15 XREVRANGE candle:SPOT:BTCUSDT:1m:stream + - COUNT 3
+
+```
+
+---
+
+### Metodo 2: Container Temporaneo (Se Redis non espone le porte all'host)
+
+Utile se Redis è in una rete Docker privata e non hai `redis-cli` installato sull'host.
+
+```bash
+docker run --rm -it --network <nome_rete_docker> redis:alpine redis-cli -h <nome_service_redis> -p 6379 -n 15
+
+```
+
+---
+
+### Metodo 3: Da Host Locale (Se la porta 6379 è mappata `6379:6379`)
+
+Se nel `docker-compose.yml` hai configurato `ports: - "6379:6379"` e hai `redis-cli` installato sulla tua macchina.
+
+```bash
+redis-cli -h localhost -p 6379 -n 15
+
+```
+
+---
+
+### Metodo 4: Script Monoriga via Python (Dal Container App)
+
+Se vuoi ispezionare i dati esattamente dal punto di vista dell'applicazione Python.
+
+```bash
+docker exec -it <nome_container_app> python -c "import redis, os; r = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'), port=6379, db=15); print(r.hgetall('candle:SPOT:BTCUSDT:1m:live'))"
+
+```
+
+---
+
+### Cheatsheet Comandi Utili da Eseguire in `redis-cli`
+
+**1. Verifica Chiavi e Tipo Dati:**
+
+```redis
+# Elenca tutte le chiavi presenti nel DB 15
+KEYS candle:*
+
+# Controlla il tipo di struttura (hash o stream)
+TYPE candle:SPOT:BTCUSDT:1m:live
+TYPE candle:SPOT:BTCUSDT:1m:stream
+
+```
+
+**2. Ispezione Candela Live (Hash):**
+
+```redis
+# Mostra tutti i campi della candela in costruzione
+HGETALL candle:SPOT:BTCUSDT:1m:live
+
+# Estrai solo specifici campi
+HMGET candle:SPOT:BTCUSDT:1m:live close volume_quote timestamp
+
+```
+
+**3. Ispezione Candele Chiuse (Stream):**
+
+```redis
+# Conta quante candele chiuse sono attualmente salvate
+XLEN candle:SPOT:BTCUSDT:1m:stream
+
+# Leggi le ultime N candele salvate (dalla più recente alla più vecchia)
+XREVRANGE candle:SPOT:BTCUSDT:1m:stream + - COUNT 5
+
+# Leggi le prime N candele salvate (dalla più vecchia alla più recente)
+XRANGE candle:SPOT:BTCUSDT:1m:stream - + COUNT 5
+
+```
+
+**4. Debugging in Tempo Reale (Monitor):**
+
+```redis
+# Traccia OGNI operazione in arrivo su Redis in tempo reale (attenzione in prod: impatta le performance)
+MONITOR
+
+```

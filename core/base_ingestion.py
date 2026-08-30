@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import logging
 import asyncio
 import random, os
+import time
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError, ResponseError
 from core.utils import timeframe_to_ms, retry_async
@@ -63,6 +64,15 @@ class BaseIngestionWorker(ABC):
 
         # Stato in memoria vitale per la riconciliazione rapida
         self.last_saved_timestamp: int = 0
+        self.time_offset_ms: int = 0 # Compensazione temporale tra server locale e broker (ms)
+
+    @abstractmethod
+    async def sync_time(self) -> None:
+        """
+        Chiama l'API REST dell'exchange per ottenere il server time.
+        Calcola e imposta self.time_offset_ms.
+        """
+        pass
 
     @abstractmethod
     async def fetch_historic_klines(self, since_timestamp: int | None = None, limit: int = 200) -> list[dict]:
@@ -105,6 +115,10 @@ class BaseIngestionWorker(ABC):
         """
         pass
 
+    def get_synced_now_ms(self) -> int:
+        """Restituisce il tempo di sistema sincronizzato con i server dell'exchange."""
+        return int(time.time() * 1000) + self.time_offset_ms
+    
     async def _get_last_redis_timestamp(self) -> int | None:
         """Legge l'ultima candela presente nello stream per evitare duplicati o buchi."""
         try:
@@ -155,7 +169,8 @@ class BaseIngestionWorker(ABC):
                     "high": str(standardized_kline["high"]),
                     "low": str(standardized_kline["low"]),
                     "close": str(standardized_kline["close"]),
-                    "volume": str(standardized_kline["volume"]),
+                    "volume_base": str(standardized_kline["volume_base"]),
+                    "volume_quote": str(standardized_kline["volume_quote"]),
                     # is_closed NON viene passato a Redis
                 },
                 id=f"{ts_str}-0",
@@ -340,7 +355,11 @@ class BaseIngestionWorker(ABC):
             rate=rate,
             capacity=capacity
         )
-        
+        # Sincronizziamo gli orologi calcolando l'offset tra server e exchange
+        # Se non ci sono problemi l'offset rimane a 0.
+        await self.limiter.acquire(requested=1)
+        await retry_async(lambda: self.sync_time(), max_retries=5, base_delay=1.5, exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
+
         backoff = 1  # secondi iniziali
         max_backoff = 150  # massimo 150s
         try:
