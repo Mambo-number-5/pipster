@@ -1,26 +1,32 @@
 import os
 import sys
 import json
-import time
 import asyncio
 import threading
 import logging
 from typing import cast
 from core.base_ingestion import BaseIngestionWorker
-
+from core.models import Candle
 from bitget.ws.bitget_ws_client import BitgetWsClient, SubscribeReq
 
 
 logger = logging.getLogger(__name__)
 
 class BitgetIngestionWorker(BaseIngestionWorker):
+    """Worker di ingestione specifico per l'exchange Bitget.
+
+    Estende `BaseIngestionWorker` implementando i connettori concreti per le API REST
+    e il feed WebSocket di Bitget. Si occupa di tradurre il formato dati nativo di Bitget
+    nel DTO centralizzato `Candle`, gestendo in thread separati le callback bloccanti
+    dell'SDK ufficiale per non interferire con l'event loop asincrono principale.
+    """
 
     def __init__(self, symbol: str, timeframe: str, inst_type: str = "SPOT"):
         """Inizializza il worker specifico per l'exchange Bitget.
 
-        Recupera le credenziali crittografiche dal file d'ambiente e inizializza
-        i client REST (MarketApi) e le strutture di sincronizzazione asincrona
-        necessarie per la gestione della concorrenza multithread.
+        Recupera le credenziali crittografiche dall'ambiente e inizializza i client 
+        REST (MarketApi) e le strutture di sincronizzazione asincrona necessarie 
+        per la gestione della concorrenza multithread tra WebSocket SDK e asyncio.
 
         Args:
             symbol (str): Il ticker di mercato (es. "BTCUSDT").
@@ -51,18 +57,41 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         # UTILIZZO DI THREADING EVENT per thread-safety tra il WS Daemon e l'Event Loop
         self._ws_stopping = threading.Event()
         self.loop = None
-        self._live_candle = None  # Cache dell'ultimo tick ricevuto
-        self.last_server_ts = 0       # ultimo timestamp del server visto nei messaggi WS
+        self._live_candle: Candle | None = None  # Cache dell'ultimo tick ricevuto
+        self.last_server_ts: int = 0       # ultimo timestamp del server visto nei messaggi WS
+
+    async def sync_time(self) -> None:
+        """Implementazione Bitget per calcolare il Time Offset."""
+        # import time
+        # try:
+        #     # Esempio di pseudo-codice usando ccxt o requests verso l'API v2 di Bitget
+        #     # L'endpoint pubblico di Bitget per il tempo è solitamente /api/v2/public/time
+        #     response = await self.rest_client.fetch_time() # o equivalente
+            
+        #     # Timestamp fornito da Bitget (in millisecondi)
+        #     server_time_ms = int(response['data']['serverTime']) 
+            
+        #     # Timestamp locale esatto nel momento in cui riceviamo la risposta
+        #     local_time_ms = int(time.time() * 1000)
+            
+        #     # Calcola l'offset
+        #     self.time_offset_ms = server_time_ms - local_time_ms
+        #     logger.info("🕒 Sincronizzazione tempo completata. Offset: %s ms", self.time_offset_ms)
+            
+        # except Exception as e:
+        #     logger.error("Impossibile sincronizzare il tempo con Bitget: %s", e)
+        #     # Se fallisce, l'offset rimane 0 (fallback all'orologio di sistema)
+        pass
 
     def _get_bitget_timeframes(self) -> tuple[str, str]:
         """Unifica e mappa i time-frame per REST API e WebSocket.
         
-        Bitget usa due standard:
+        Bitget usa due standard di formattazione:
         - REST SPOT: 1min, 5min, 1h, 1day...
-        - REST MIX & WebSocket (tutti): 1m, 5m, 1H, 1D...
+        - REST MIX & WebSocket: 1m, 5m, 1H, 1D...
 
         Returns:
-            tuple[str, str]: (rest_granularity, ws_channel_name)
+            tuple[str, str]: Una tupla contenente (rest_granularity, ws_channel_name).
         """
         tf_lower = self.timeframe.lower()
         
@@ -85,18 +114,17 @@ class BitgetIngestionWorker(BaseIngestionWorker):
 
     # ------------------------ REST (WARM-UP) ------------------------
     def _sync_fetch_klines(self, since_timestamp: int | None, limit: int) -> dict[str, str]:
-        """Esegue la chiamata REST sincrona e bloccante all'SDK ufficiale Bitget per recuperare lo storico.
+        """Esegue la chiamata REST sincrona all'SDK ufficiale Bitget per recuperare lo storico.
 
-        Questo metodo non deve essere invocato direttamente nell'event loop principale per evitare
-        il blocco del thread asincrono. Deve essere incapsulato in un thread separato.
+        Questo metodo viene delegato a un thread separato tramite `asyncio.to_thread` 
+        per evitare di bloccare l'event loop asincrono principale durante le richieste I/O.
 
         Args:
-            since_timestamp (int | None): Timestamp Unix in millisecondi da cui iniziare il recupero.
-                Se None, l'exchange restituisce i dati più recenti a ritroso.
+            since_timestamp (int | None): Timestamp (ms) da cui iniziare il recupero.
             limit (int): Numero massimo di candele da scaricare.
 
         Returns:
-            dict: La risposta JSON grezza restituita dai server di Bitget.
+            dict: Risposta JSON grezza restituita dall'API Bitget.
         """
         rest_granularity, _ = self._get_bitget_timeframes()
         start_time = str(since_timestamp) if since_timestamp else ""
@@ -115,60 +143,48 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         logger.debug("DEBUG - parametri REST: %s", parameters)
         return cast(dict, self.market_client.candles(params=parameters))
 
-    async def fetch_historic_klines(self, since_timestamp: int | None = None, limit: int = 200) -> list[dict]:
-        """Scarica, convalida e normalizza le candele storiche da Bitget tramite chiamate REST.
+    async def fetch_historic_klines(self, since_timestamp: int | None = None, limit: int = 200) -> list[Candle]:
+        """Scarica, convalida e normalizza le candele storiche da Bitget tramite REST.
 
-        Implementazione dell'interfaccia astratta della classe base. Gestisce la richiesta
-        in un thread dedicato, applica un timeout di sicurezza di 30 secondi e valida
-        il codice di stato della risposta dell'exchange.
+        Gestisce la richiesta in un thread dedicato, applica un timeout di sicurezza, 
+        valida la risposta ed istanzia gli oggetti DTO `Candle`.
 
         Args:
-            since_timestamp (int | None, optional): Timestamp iniziale in millisecondi. Defaults to None.
-            limit (int, optional): Numero di candele storiche da richiedere. Defaults to 200.
+            since_timestamp (int | None, optional): Timestamp (ms) da cui iniziare.
+            limit (int, optional): Numero di candele da scaricare. Defaults to 200.
 
         Returns:
-            list[dict]: Lista di dizionari normalizzati e ordinati cronologicamente pronti per Redis::
-
-                {
-                    "timestamp": int,
-                    "open": float,
-                    "high": float,
-                    "low": float,
-                    "close": float,
-                    "volume_base": float,
-                    "volume_quote": float,
-                    "is_closed": bool
-                }
+            list[Candle]: Lista di candele normalizzate e ordinate cronologicamente.
         """
         # MODIFICA: timeout di 30 secondi per la chiamata sincrona in thread
         response = await asyncio.wait_for(
             asyncio.to_thread(self._sync_fetch_klines, since_timestamp, limit), timeout=30)
         
-        standardized_data = []
+        standardized_data: list[Candle] = []
         # MODIFICA: verifica esplicita del codice di successo
         if response and response.get("code") == "00000" and "data" in response:
             quote_index = 7 if self.inst_type == "SPOT" else 6  # Bitget REST SPOT ha un campo in più per il volume quote
             for kline in response["data"]:
-                standardized_data.append({
-                    "timestamp": int(kline[0]),
-                    "open": float(kline[1]),
-                    "high": float(kline[2]),
-                    "low": float(kline[3]),
-                    "close": float(kline[4]),
-                    "volume_base": float(kline[5]),
-                    "volume_quote": float(kline[quote_index]),
-                    "is_closed": True  # Bitget REST fornisce solo candele chiuse
-                })
+                standardized_data.append(
+                    Candle(timestamp=int(kline[0]),
+                    open=float(kline[1]),
+                    high=float(kline[2]),
+                    low=float(kline[3]),
+                    close=float(kline[4]),
+                    volume_base=float(kline[5]),
+                    volume_quote=float(kline[quote_index]),
+                    is_closed=True  # Bitget REST fornisce solo candele storicizzate (chiuse)
+                ))
             # Sicurezza extra: il sort è ora gestito anche dalla classe base, 
             # ma farlo qui male non fa (costo computazionale quasi nullo grazie al Timsort)
-            standardized_data.sort(key=lambda x: x["timestamp"])
+            standardized_data.sort(key=lambda x: x.timestamp)
         else:
             logger.warning("⚠️ Risposta API inattesa o errore: %s", response.get('msg', response))
         
         return standardized_data
 
     # ------------------------ WEBSOCKET (LIVE) ------------------------
-    def _ws_callback(self, message):
+    def _ws_callback(self, message: str) -> None:
         """Callback sincrona invocata dal thread daemon interno dell'SDK Bitget alla ricezione di un messaggio.
 
         Inserisce il messaggio grezzo all'interno della coda asincrona in modo thread-safe,
@@ -191,31 +207,36 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                 pass
 
     def _ws_error_callback(self, error):
-        """Callback di gestione degli errori interni sollevati dal thread del WebSocket di Bitget.
+        """Intercetta gli errori interni sollevati dal thread del WebSocket di Bitget.
 
         Args:
             error (Exception/str): L'eccezione o il messaggio d'errore intercettato dal socket.
         """
         logger.warning("⚠️ [Bitget WS Error]: %s", error)
 
-    async def _flush_live_candle_if_expired(self):
+    async def _flush_live_candle_if_expired(self) -> None:
+        """Verifica se la candela live in memoria è temporalmente scaduta.
+        
+        Utile per forzare la chiusura di una candela in periodi di bassa volatilità
+        o quando il mercato non invia nuovi trade che spingono avanti il timestamp.
+        """
         if self._live_candle is None:
             return
         # Usa il timestamp del server se disponibile, altrimenti quello locale
-        now_ms = self.last_server_ts or int(time.time() * 1000)
-        if now_ms >= self._live_candle["timestamp"] + self.tf_ms:
-            self._live_candle["is_closed"] = True
+        now_ms = self.last_server_ts or self.get_synced_now_ms()
+        if now_ms >= self._live_candle.timestamp + self.tf_ms:
+            self._live_candle.is_closed = True
             await self.process_live_candle(self._live_candle)
             self._live_candle = None
 
     async def _process_raw_message(self, raw_message: str):
-        """Elabora un singolo messaggio grezzo ricevuto dal WebSocket.
+        """Elabora il JSON WebSocket, istanzia `Candle` e orchestra la riconciliazione.
 
-        Esegue il parsing JSON, estrae le candele, deduce se sono chiuse, 
-        e le inoltra al motore di riconciliazione (`process_live_candle`).
+        Usa un meccanismo a "Watermark" basato sull'avanzamento dei timestamp 
+        per dedurre matematicamente quando la candela precedente deve considerarsi chiusa.
 
         Args:
-            raw_message (str): Il payload JSON grezzo ricevuto dal WebSocket.
+            raw_message (str): Il payload JSON grezzo da Bitget.
         """
         try:
             message = json.loads(raw_message)
@@ -229,26 +250,27 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                 # I campi posizionali seguono l'ordine documentato
 
                 ts = int(item[0])  # timestamp in millisecondi
-                standardized = {
-                    "timestamp": ts,
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume_base": float(item[5]),   # volume in moneta base
-                    "volume_quote": float(item[6]),  # volume in moneta quota
-                    "is_closed": False
-                }
+                # Istanzia la dataclass invece del dizionario
+                current_candle = Candle(
+                    timestamp=ts,
+                    open=float(item[1]),
+                    high=float(item[2]),
+                    low=float(item[3]),
+                    close=float(item[4]),
+                    volume_base=float(item[5]),
+                    volume_quote=float(item[6]),
+                    is_closed=False
+                )
 
                 # Logica Watermark: se il timestamp è maggiore di quello in cache, la candela precedente è chiusa
                 if self._live_candle is not None:
-                    if ts > self._live_candle["timestamp"]:
+                    if ts > self._live_candle.timestamp:
                         # 1. Chiudi la candela precedente e inviala
-                        self._live_candle["is_closed"] = True
+                        self._live_candle.is_closed = True
                         await self.process_live_candle(self._live_candle)
                 
                 # 2. Aggiorna la cache con il tick corrente
-                self._live_candle = standardized
+                self._live_candle = current_candle
             
                 # 3. Invia l'aggiornamento "live" (is_closed = False)
                 await self.process_live_candle(self._live_candle)
@@ -259,12 +281,11 @@ class BitgetIngestionWorker(BaseIngestionWorker):
             logger.error("Errore imprevisto durante l'elaborazione del messaggio WS: %s", e, exc_info=True)
 
     async def listen_websocket_stream(self):
-        """Gestisce la connessione persistente al WebSocket live di Bitget e consuma la coda dati.
+        """Gestisce il ciclo di vita del WebSocket Bitget, consumando i dati dalla coda.
 
-        Inizializza il client WS nativo, si iscrive al canale corretto (es. candle15m) e processa
-        i messaggi in arrivo filtrando i pacchetti e delegando l'inserimento su Redis.
-        Include un controllo di timeout a 60 secondi per rilevare connessioni silenti o morte,
-        forzando una disconnessione pulita in caso di inattività.
+        Include watchdog e controlli di inattività per forzare la riconnessione automatica 
+        se il feed si blocca. Garantisce una chiusura pulita svuotando la coda e arrestando 
+        i thread pendenti in caso di stop.
 
         Raises:
             ConnectionError: Sollevato se non vengono ricevuti dati dal WebSocket entro 60 secondi,
@@ -289,7 +310,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         try:
             # Timeout breve (es. 5-10s) per fare check periodici senza bloccare il loop
             CHECK_INTERVAL = 10.0
-            last_msg_time = time.time()
+            last_msg_time = self.get_synced_now_ms()
             is_debugging = sys.gettrace() is not None
             max_inactivity = 300 if is_debugging else 60
             while self.running:
@@ -297,7 +318,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                     raw_message = await asyncio.wait_for(self.ws_queue.get(), timeout=CHECK_INTERVAL)
 
                     # Aggiorna l'orario dell'ultimo messaggio valido ricevuto
-                    last_msg_time = time.time()
+                    last_msg_time = self.get_synced_now_ms()
 
                     # Elabora il messaggio
                     await self._process_raw_message(raw_message)
@@ -312,7 +333,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
 
                     
                     # Verifica inattività prolungata per riconnessione
-                    if (time.time() - last_msg_time) > max_inactivity:
+                    if (self.get_synced_now_ms() - last_msg_time) > max_inactivity:
                         logger.error("Nessun dato WebSocket da %ss. Forzo riconnessione.", max_inactivity)
                     raise ConnectionError("WebSocket inattivo")
                 
