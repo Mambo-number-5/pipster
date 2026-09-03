@@ -162,7 +162,7 @@ class BitgetIngestionWorker(BaseIngestionWorker):
         
         standardized_data: list[Candle] = []
         # MODIFICA: verifica esplicita del codice di successo
-        if response and response.get("code") == "00000" and "data" in response:
+        if isinstance(response, dict) and response.get("code") == "00000" and "data" in response:
             quote_index = 7 if self.inst_type == "SPOT" else 6  # Bitget REST SPOT ha un campo in più per il volume quote
             for kline in response["data"]:
                 standardized_data.append(
@@ -359,6 +359,9 @@ class BitgetIngestionWorker(BaseIngestionWorker):
                         # per evitare duplicazione di codice, estrai una funzione helper
                         await self._process_raw_message(raw)
                         self.ws_queue.task_done()
+
+                    # Controlla se l'ultima candela è scaduta
+                    await self._flush_live_candle_if_expired()
                 except asyncio.QueueEmpty:
                     pass
                 except Exception:
