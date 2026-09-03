@@ -18,9 +18,7 @@ async def retry_async(
     exceptions: type[BaseException] | tuple[type[BaseException], ...] = (
         asyncio.TimeoutError,
         ConnectionError,
-        OSError,
-    ),
-) -> T:
+        OSError)) -> T:
     """Esegue una funzione asincrona applicando una strategia di Exponential Backoff con Jitter.
 
     Args:
@@ -71,36 +69,3 @@ def timeframe_to_ms(timeframe: str) -> int:
 def get_current_timestamp_ms() -> int:
     """Restituisce il tempo di sistema in millisecondi (UTC)."""
     return int(time.time() * 1000)
-
-class AsyncHttpClient:
-    """Client HTTP asincrono generico per le richieste REST del bot."""
-    
-    def __init__(self):
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Garantisce che la sessione sia inizializzata nell'event loop corretto."""
-        if self._session is None or self._session.closed:
-            # Qui puoi aggiungere timeout generici per tutte le chiamate
-            timeout = aiohttp.ClientTimeout(total=10) 
-            self._session = aiohttp.ClientSession(timeout=timeout)
-        return self._session
-
-    async def get(self, url: str, headers: Optional[Dict] = None, params: Optional[Dict] = None) -> Dict[str, Any]:
-        """Esegue una richiesta GET asincrona."""
-        session = await self._get_session()
-        async with session.get(url, headers=headers, params=params) as response:
-            response.raise_for_status()  # Solleva eccezione se status != 2xx
-            return await response.json()
-
-    async def post(self, url: str, headers: Optional[Dict] = None, json_data: Optional[Dict] = None, data: Any = None) -> Dict[str, Any]:
-        """Esegue una richiesta POST asincrona."""
-        session = await self._get_session()
-        async with session.post(url, headers=headers, json=json_data, data=data) as response:
-            response.raise_for_status()
-            return await response.json()
-
-    async def close(self):
-        """Chiude la sessione HTTP (da chiamare nello shutdown)."""
-        if self._session and not self._session.closed:
-            await self._session.close()

@@ -3,7 +3,8 @@ import unittest
 import redis.asyncio as redis
 from typing import cast
 from core.base_ingestion import BaseIngestionWorker
-from core.rate_limiter import RedisTokenBucket
+from core.token_bucket import RedisTokenBucket
+from core.models import Candle
 from core.utils import retry_async
 
 # ==========================================
@@ -30,6 +31,8 @@ class DummyTestWorker(BaseIngestionWorker):
     async def listen_websocket_stream(self):
         pass
 
+    async def sync_time(self):
+        return int(time.time() * 1000)  # Simuliamo il tempo corrente in ms 
 
 # ==========================================
 # SUITE DI TEST SU FERRO (DB 15)
@@ -54,8 +57,10 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
     # --- TEST 1: Token Bucket ---
     async def test_token_bucket_rate_limiting(self):
         """Verifica che il bucket blocchi le richieste sopra il burst e calcoli l'attesa."""
-        limiter = RedisTokenBucket(self.worker.redis, key="test_limit", rate=10, capacity=5)
-        
+        if self.worker.redis is not None:
+            limiter = RedisTokenBucket(self.worker.redis, key="test_limit", rate=10, capacity=5)
+        else:
+            raise TypeError
         start_time = time.time()
         # Svuotiamo istantaneamente la capacità massima (5 token)
         await limiter.acquire(requested=5)
@@ -72,10 +77,12 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
     # --- TEST 2: Inserimento Stream e Prevenzione Duplicati ---
     async def test_push_to_redis_prevents_duplicates(self):
         """Verifica che Redis nativamente scarti candele con ID identici o vecchi."""
-        kline = {
-            "timestamp": 1690000000000,
-            "open": 1, "high": 2, "low": 1, "close": 2, "volume": 100
-        }
+        kline = Candle(
+            timestamp=1690000000000,
+            open=1, high=2, low=1, close=2, volume_base=100, volume_quote=10, is_closed=True)
+
+        if self.worker.redis is None:
+            raise TypeError
         
         # Primo inserimento: successo
         await self.worker.push_to_redis(kline)
@@ -90,11 +97,13 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
     # --- TEST 3: Routing delle Candele (Aperte vs Chiuse) ---
     async def test_process_live_candle_routing(self):
         """Verifica che le candele aperte vadano in HASH e le chiuse nello STREAM."""
+        import copy
+        if self.worker.redis is None:
+                    raise TypeError
         # Candela APERTA
-        open_kline = {
-            "timestamp": 1690000000000, "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 50,
-            "is_closed": False
-        }
+        open_kline = Candle(
+            timestamp=1690000000000, open=1, high=2, low=1, close=1.5, volume_base=50, volume_quote=5,
+            is_closed=False)
         await self.worker.process_live_candle(open_kline)
         
         hash_exists = await self.worker.redis.exists(self.worker.redis_live_key)
@@ -103,9 +112,9 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream_len, 0, "La candela aperta è finita nello Stream")
 
         # Candela CHIUSA
-        closed_kline = open_kline.copy()
-        closed_kline["is_closed"] = True
-        closed_kline["close"] = 2.0  # Chiusura definitiva
+        closed_kline = copy.copy(open_kline)
+        closed_kline.is_closed = True
+        closed_kline.close = 2.0  # Chiusura definitiva
         await self.worker.process_live_candle(closed_kline)
 
         stream_len2 = await self.worker.redis.xlen(self.worker.redis_stream)
@@ -116,13 +125,13 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
         """Verifica che un buco cronologico faccia scattare il recupero (gap fill)."""
         # Simuliamo di avere già la candela T1 in memoria
         self.worker.last_saved_timestamp = 1690000000000
+        if self.worker.redis is None:
+                    raise TypeError
         
         # Arriva una candela 2 timeframe più tardi (es. manca una candela da 15m in mezzo)
         t_gap = self.worker.last_saved_timestamp + (self.worker.tf_ms * 2)
-        future_kline = {
-            "timestamp": t_gap, "open": 1, "high": 2, "low": 1, "close": 2, "volume": 100,
-            "is_closed": True
-        }
+        future_kline = Candle(timestamp=t_gap, open=1, high=2, low=1, close=2, volume_base=100, volume_quote=10,
+            is_closed=True)
         
         # Il motore dovrebbe notare il gap e chiamare fetch_historic_klines
         await self.worker.process_live_candle(future_kline)
@@ -159,6 +168,9 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
     async def test_historical_gap_pagination(self):
         """Verifica che la paginazione continui fino all'esaurimento dei dati."""
         call_count = 0
+
+        if self.worker.redis is None:
+            raise TypeError
 
         # Sovrascriviamo temporaneamente fetch_historic_klines per simulare 5 candele paginate a blocchi di 2
         async def mock_paginated_fetch(since_timestamp=None, limit=200):
@@ -201,10 +213,9 @@ class TestIngestionEngineRealRedis(unittest.IsolatedAsyncioTestCase):
     async def test_warmup_logic_from_scratch(self):
         """Verifica che il warm-up su DB vuoto legga l'ultimo dato e inizializzi correttamente lo stato."""
         # Simuliamo un DB che contiene già una candela
-        first_kline = {
-            "timestamp": 1690000000000,
-            "open": 100, "high": 105, "low": 99, "close": 102, "volume": 500
-        }
+        first_kline = Candle(
+            timestamp=1690000000000,
+            open=100, high=105, low=99, close=102, volume_base=500, volume_quote=50, is_closed=True)
         await self.worker.push_to_redis(first_kline)
 
         # Inizializziamo un nuovo worker per verificare la lettura dello stato iniziale da Redis

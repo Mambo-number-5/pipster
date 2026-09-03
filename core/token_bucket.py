@@ -80,19 +80,38 @@ class RedisTokenBucket:
             now_ms = int(time.time() * 1000)
             
             # Eseguiamo lo script
-            wait_ms = cast(int, await self._lua_script(
+            wait_ms = await self._lua_script(
                 keys=[self.key],
                 args=[self.capacity, self.rate, now_ms, requested]
-            ))
+            )
 
             # Log a livello DEBUG: utile per il debug e i test, ignorato in produzione
             # se il livello del logger è INFO o superiore (overhead trascurabile)
             logger.debug("TokenBucket %s: requested=%s wait_ms=%s", self.key, requested, wait_ms)
 
 
-            # Se Redis ci dice 0, abbiamo il semaforo verde
-            if wait_ms == 0:
+            # Se Redis ci dice 0 (o un nuomero negativo, impossibile), abbiamo il semaforo verde
+            if cast(int, wait_ms) < 1:
                 return
             
             # Altrimenti dormiamo in modo asincrono esattamente per il tempo calcolato
-            await asyncio.sleep(wait_ms / 1000.0)
+            await asyncio.sleep(cast(int, wait_ms) / 1000.0)
+
+class RateLimitManager:
+    def __init__(self, redis_client: redis.Redis, exchange: str):
+        self.redis = redis_client
+        self.exchange = exchange
+        self.buckets = {}
+
+    def add_bucket(self, name: str, rate: float, capacity: int):
+        self.buckets[name] = RedisTokenBucket(
+            redis_client=self.redis,
+            key=f"rate_limit:{self.exchange}:{name}",
+            rate=rate,
+            capacity=capacity
+        )
+
+    async def acquire(self, *bucket_names: str, requested: int = 1):
+        """Acquisisce token da tutti i bucket specificati."""
+        for name in bucket_names:
+            await self.buckets[name].acquire(requested=requested)

@@ -262,7 +262,7 @@ class BaseIngestionWorker(ABC):
                 break
             if len(data) < limit:
                 break  # ultima pagina
-            current_start = last_ts + 1
+            current_start = ((last_ts // self.tf_ms) + 1) * self.tf_ms
         else:
             logger.warning("Raggiunto il numero massimo di iterazioni (%d) durante il fill gap.", max_iterations)
 
