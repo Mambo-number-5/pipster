@@ -275,3 +275,486 @@ asyncio.run(worker.run())
 ```
 
 ---
+
+# 09/06/2026
+Ecco la spiegazione dettagliata di come `BitgetIngestionWorker` eredita da `BaseIngestionWorker` e come funziona il flusso, con attenzione alle scelte asincrone.
+
+---
+
+## 1. Ereditarietà e implementazione dei metodi astratti
+
+La classe `BitgetIngestionWorker` **eredita** da `BaseIngestionWorker` e quindi **deve obbligatoriamente implementare** i due metodi astratti:
+
+- `fetch_historic_klines(self, since_timestamp, limit)` → per lo storico via REST.
+- `listen_websocket_stream(self)` → per il flusso live via WebSocket.
+
+Inoltre aggiunge:
+- Attributi specifici Bitget: `inst_type` (SPOT o FUTURES), chiavi API, `market_client` (SDK REST), `ws_queue` (coda asincrona per il ponte tra thread), `loop` (riferimento all’event loop).
+- Metodi di supporto: `_map_timeframe_to_bitget`, `_sync_fetch_klines`, `_ws_callback`, `_ws_error_callback`.
+
+L’ereditarietà permette di **riutilizzare** tutto il ciclo di vita (connessione Redis, warm-up, loop principale con riconnessioni, graceful shutdown) senza riscriverlo. Il worker concreto si occupa solo delle interazioni con il broker specifico.
+
+---
+
+## 2. Flusso completo del `BitgetIngestionWorker` quando si chiama `asyncio.run(worker.run())`
+
+### Fase 0 – Inizializzazione
+Viene creata l’istanza:
+```python
+worker = BitgetIngestionWorker(symbol="BTCUSDT", timeframe="15m", inst_type="SPOT")
+```
+- Viene chiamato `__init__` della classe base, che imposta `symbol`, `timeframe`, `redis_stream`, ecc.
+- Poi `__init__` della classe figlia imposta `inst_type`, carica le chiavi, crea `market_client` (client REST sincrono dell’SDK), crea `ws_queue` e `loop = None`.
+
+### Fase 1 – Avvio di `run()` (ereditato dalla base)
+`asyncio.run(worker.run())` lancia l’event loop ed esegue la coroutine `run()` della classe base.
+
+**1.1 Connessione a Redis**  
+`self.redis = redis.Redis(...)` – prepara il client asincrono.
+
+**1.2 Warm-up storico (`_warmup_storico`)**  
+La base chiama `await self._get_last_redis_timestamp()` per sapere l’ultima candela già salvata (se esiste).  
+Poi chiama `await self.fetch_historic_klines(since_timestamp=last_ts)`.
+
+Qui **la classe figlia** esegue la sua implementazione di `fetch_historic_klines`.
+
+---
+
+### Fase 2 – Implementazione di `fetch_historic_klines` (asincrona con `to_thread`)
+
+```python
+async def fetch_historic_klines(self, since_timestamp, limit):
+    response = await asyncio.to_thread(self._sync_fetch_klines, since_timestamp, limit)
+    # ... normalizza e restituisce
+```
+
+**Perché `asyncio.to_thread`?**  
+Il metodo `_sync_fetch_klines` chiama `self.market_client.candles(...)`, che è una funzione **sincrona e bloccante** (tipica degli SDK REST). Se la chiamassi direttamente all’interno di una coroutine, bloccherebbe l’intero event loop per tutta la durata della richiesta, vanificando l’asincronia.
+
+`asyncio.to_thread` esegue la funzione in un **thread separato** del pool di thread di asyncio, e `await` attende che il thread termini. Durante l’attesa, l’event loop può eseguire altre coroutine (qui non ce ne sono, ma è una buona pratica).
+
+Una volta ottenuta la risposta, il metodo normalizza i dati (converte stringhe in float/int) e li ordina per timestamp.
+
+**Attenzione:** La normalizzazione e l’ordinamento sono operazioni sincrone veloci – non bloccano significativamente l’event loop, quindi vanno bene direttamente nella coroutine.
+
+Il risultato viene restituito alla classe base, che lo filtra (solo timestamp > last_ts) e chiama `push_to_redis` per ogni candela (operazione asincrona, con `await`).
+
+---
+
+### Fase 3 – Warm-up completato, si passa al loop live
+
+La base entra nel `while self.running` e chiama `await self.listen_websocket_stream()`.
+
+#### 3.1 Preparazione del WebSocket asincrono “ibrido”
+
+Il metodo `listen_websocket_stream` della classe figlia fa queste operazioni:
+
+- Salva il loop corrente: `self.loop = asyncio.get_running_loop()`.
+- Crea un client WebSocket **sincrono** di Bitget (`BitgetWsClient`). Questo client, quando chiamato `build()`, avvia un **thread interno** che gestisce la connessione WebSocket e chiama callback quando arrivano messaggi.
+- Imposta le callback: `ws_client.subscribe(req, self._ws_callback)` e `ws_client.error_listener`.
+- Avvia il client con `ws_client.build()` – **operazione sincrona non bloccante** (il thread parte e ritorna subito).
+
+#### 3.2 La callback `_ws_callback` – ponte tra thread e asyncio
+
+```python
+def _ws_callback(self, message):
+    asyncio.run_coroutine_threadsafe(self.ws_queue.put(message), self.loop)
+```
+
+- Questa callback viene eseguita **nel thread interno** dell’SDK, **non** nell’event loop di asyncio.
+- Non possiamo usare `await` qui (sarebbe SyntaxError). Dobbiamo comunicare con l’event loop in modo thread‑safe.
+- `asyncio.run_coroutine_threadsafe` prende una coroutine (`self.ws_queue.put(message)`) e un loop target, e la programma per essere eseguita su quel loop. Restituisce un `concurrent.futures.Future` (che ignoriamo).
+- `self.ws_queue` è una `asyncio.Queue` – un contenitore thread‑safe specifico per asyncio. Il suo metodo `put` è una coroutine; viene eseguita nell’event loop principale, e il messaggio viene accodato.
+
+#### 3.3 Loop principale di ascolto
+
+```python
+while self.running:
+    message = await self.ws_queue.get()
+    for item in message["data"]:
+        standardized = {...}
+        await self.push_to_redis(standardized)
+    self.ws_queue.task_done()
+```
+
+- `await self.ws_queue.get()` sospende la coroutine finché non arriva un messaggio nella coda. Mentre aspetta, l’event loop è libero (ma qui non ci sono altre coroutine, quindi rimane in idle).
+- Quando il thread WebSocket riceve un messaggio, lo mette nella coda, e il task si risveglia.
+- Per ogni candela nel messaggio, normalizza e chiama `await self.push_to_redis` – operazione asincrona che scrive su Redis.
+- L’event loop, durante l’attesa della scrittura su Redis, **potrebbe** eseguire altre coroutine (se ce ne fossero), ma in questo caso siamo nel thread principale e non ci sono altre coroutine attive. Resta il fatto che `push_to_redis` cede il controllo e la coroutine `listen_websocket_stream` viene sospesa fino al completamento della scrittura.
+
+#### 3.4 Gestione della chiusura
+
+- Alla ricezione di `CancelledError` (durante lo shutdown), viene rilanciata dopo aver stampato un messaggio. Questo permette alla base di catturarla, uscire dal loop e chiudere Redis.
+
+- Il `finally` chiude il client WebSocket sincrono (`ws_client.close()`), terminando il thread interno.
+
+---
+
+### Fase 4 – Riconnessione automatica (gestita dalla classe base)
+
+Se `listen_websocket_stream` termina con un’eccezione (es. fallimento della connessione, errore di Redis propagato da `push_to_redis`), la base la cattura, attende 5 secondi e riprova a chiamare `listen_websocket_stream` (che ricreerà tutto da capo: nuovo client WS, nuova sottoscrizione). Questo garantisce resilienza.
+
+---
+
+## 3. Scelte asincrone notevoli e perché sono state fatte
+
+| Scelta | Motivo |
+|--------|--------|
+| `asyncio.to_thread` per le chiamate REST | L’SDK Bitget fornisce solo funzioni **sincrone** (bloccanti). Per non bloccare l’event loop, le si esegue in un thread separato. |
+| `asyncio.Queue` come ponte | Il WebSocket SDK di Bitget è **sincrono** e usa callback in thread separati. Per trasferire i messaggi all’event loop asyncio in modo thread‑safe, si usa una coda asincrona. |
+| `asyncio.run_coroutine_threadsafe` nella callback | Permette di chiamare una coroutine (`queue.put`) dall’esterno dell’event loop (dal thread dell’SDK) in modo sicuro. |
+| `self.loop = asyncio.get_running_loop()` | Necessario per sapere su quale loop eseguire `run_coroutine_threadsafe`. |
+| Nessun `try/except` su `push_to_redis` (come nella base modificata) | Qualsiasi errore Redis fa terminare `listen_websocket_stream`, innescando la riconnessione gestita dalla base. |
+
+---
+
+## 4. Schema riassuntivo del flusso asincrono nel worker Bitget
+
+```
+asyncio.run(worker.run())
+    │
+    ├─ redis = connessione asincrona
+    │
+    ├─ _warmup_storico()
+    │    ├─ _get_last_redis_timestamp()   (async, leggero)
+    │    └─ fetch_historic_klines()
+    │         └─ await asyncio.to_thread(_sync_fetch_klines)   (blocco in thread separato)
+    │         └─ normalizzazione e ordinamento (sincrono veloce)
+    │    └─ per ogni candela: await push_to_redis()   (asincrono, scrive su Redis)
+    │
+    └─ while self.running:
+           try:
+               await listen_websocket_stream()
+           except Exception:
+               await asyncio.sleep(5)   # riconnessione
+
+Dentro listen_websocket_stream():
+    │
+    ├─ ottiene loop corrente
+    ├─ crea ws_client sincrono, imposta callback
+    ├─ ws_client.build() → parte thread interno
+    │
+    └─ while self.running:
+           message = await ws_queue.get()       # aspetta messaggi dal thread
+           for candela in message["data"]:
+               await push_to_redis(candela)    # scrive su Redis
+```
+
+**Nel thread interno dell’SDK Bitget:**
+- Riceve un messaggio WebSocket → chiama `_ws_callback`
+- `_ws_callback` esegue `asyncio.run_coroutine_threadsafe(ws_queue.put(...), loop)`
+- La coroutine `ws_queue.put` viene programmata nell’event loop principale e accoda il messaggio.
+
+---
+
+## Conclusione
+
+La classe `BitgetIngestionWorker` sfrutta l’ereditarietà per riutilizzare tutta la logica robusta di `BaseIngestionWorker` (connessione Redis, warm-up intelligente, riconnessioni, shutdown). Le **scelte asincrone** (thread per REST, coda+run_coroutine_threadsafe per WebSocket) sono necessarie per integrare librerie sincrone (SDK Bitget) in un’architettura asincrona, senza bloccare l’event loop. Il flusso complessivo mantiene la concorrenza e la resilienza.
+
+# Note di Sviluppo - Ingestion Engine (Bitget)
+
+## ⚡ Gestione dei Timeout e Resilienza Live
+Nell'implementazione del connettore Bitget, il WebSocket viene gestito tramite un'architettura a coda asincrona (`asyncio.Queue`) per fare da ponte con l'SDK multithread nativo. Per prevenire il problema delle connessioni "metà aperte" (Half-Open Connections, in cui il socket TCP muore silenziosamente senza inviare un close frame), è stato implementato un timeout di 60 secondi sulla lettura della coda.
+
+### ⚠️ Edge Case: Asset a Bassa Liquidità
+Il timeout a 60 secondi agisce come un "heartbeat logico basato sui dati". 
+- **Asset ad alta liquidità (es. BTCUSDT):** Funziona perfettamente poiché viene generata e aggiornata almeno una candela (o tick) al secondo.
+- **Asset a bassa liquidità (es. Ticker esotici Spot):** Se sul mercato non avvengono trade per più di 60 secondi, il WebSocket non riceverà dati aggiornati. Questo causerà un falso positivo: il bot crederà che la connessione sia morta e forzerà un ciclo continuo e inutile di disconnessione/riconnessione.
+
+**Soluzioni/Mitigazioni Future:**
+1. **Innalzamento del Timeout:** Portare il timeout a 300 secondi (5 minuti) o più se si tracciano coppie illiquide.
+2. **Heartbeat Nativo (Ping/Pong):** Invece di monitorare la presenza di dati di mercato, intercettare i frame di `ping/pong` nativi scambiati tra l'SDK di Bitget e i server dell'exchange per validare lo stato del link TCP indipendentemente dai trade reali.
+
+---
+
+# 18/06/2026
+Esatto, è proprio così: questo comportamento è universale per qualsiasi codice Python (sincrono o asincrono) che esegua un loop o un processo continuo e che venga debuggato in modalità **`attach`** dentro Docker. Con il `TradingWorker` succedeva la stessa cosa, ma i cicli erano speculari e non essendoci una fase di warm-up iniziale lineare (che scarica dati una volta sola al boot), l'effetto "salto temporale" era invisibile all'occhio.
+
+Ecco il riassunto pronto da copiare e incollare nel tuo `notes.md` per fissare la procedura.
+
+---
+
+```markdown
+## 🛑 Debugging Remoto in Docker (Modalità Attach): Regole e Flusso
+
+Quando ci si aggancia a un container con il debugger (`request: attach`), lo "Stop" di VS Code disconnette solo l'interfaccia grafica, ma **NON** uccide il processo Python dentro Docker. Se il codice contiene cicli infiniti o task asincroni (`asyncio`), questi continueranno a girare in background.
+
+### Il Problema del "Secondo Avvio"
+1. **Primo F5:** Il container è vergine, `--wait-for-client` blocca Python alla riga zero. Il debugger si aggancia, esegue il warm-up e va nel loop.
+2. **Disconnessione (Shift+F5):** Il debugger si stacca, ma Python continua a girare nel loop infinito dentro Docker.
+3. **Secondo F5:** Il debugger si riaggancia, ma Python è già nel loop. Salta i breakpoint iniziali, il warm-up non si rivede (perché è già passato) e i log del terminale si sfasano.
+
+---
+
+### 🔄 Flusso di Lavoro Corretto (La Routine di Debug)
+
+Per testare modifiche al codice o rieseguire il flusso dall'inizio (incluso il Warm-up):
+
+1. **Uccidi il processo fantasma (Riavvia il container):**
+   Prima di premere F5, lancia da terminale sul tuo PC:
+   ```bash
+   docker restart pipster_bot
+
+```
+
+*Nota: Il container si riavvierà e si bloccherà alla riga zero in attesa del client.*
+
+2. **Aggancia il debugger:**
+Premi **F5** su VS Code per avviare la configurazione `Python: Docker Debug`. I breakpoint iniziali verranno ora rispettati regolarmente.
+3. **Usa il terminale nativo di Docker per i Log:**
+La console di debug di VS Code può perdersi i `print()` asincroni a causa dei buffer TCP. Per la certezza matematica di vedere tutto l'output in tempo reale, tieni un terminale separato aperto con:
+```bash
+docker logs -f pipster_bot
+
+```
+
+
+
+### ⚡ Gestione dei Breakpoint nell'Asincrono (`asyncio`)
+
+* **Evita lo Step Over (F10) sugli `await`:** Nelle librerie di rete (come il WebSocket di Bitget), fare il passo singolo su un `await` rilascia il controllo all'event loop. Se nel frattempo scattano timeout o ping di sottofondo, il debugger perde il filo e l'esecuzione "scappa".
+* **Strategia:** Metti un breakpoint sulla riga *successiva* all'operazione asincrona e premi **Continua (F5)** invece di avanzare a passi.
+
+```
+
+```
+
+---
+# 19/06/2026
+
+Massima concentrazione. Se hai visto che `params` è un dizionario, hai decifrato la "filosofia segreta" di questa libreria.
+
+Gli sviluppatori di Bitget hanno fatto una scelta strutturale drastica: **non hanno mappato i singoli parametri delle funzioni in Python**. Hanno preferito creare dei metodi "passacarte" che prendono un dizionario generico e lo girano direttamente alle loro API HTTP.
+
+Ecco la mappa definitiva per capire come è organizzata la libreria e come usarla senza impazzire.
+
+---
+
+## L'Architettura dell'SDK Bitget
+
+Quando vedi un import del tipo `from bitget.v2.mix.market_api import MarketApi`, la struttura a matrioska si scompone così:
+
+* **`v2` (o `v1`)**: Indica la versione dell'endpoint dell'exchange. Usa sempre la **`v2`** dove disponibile, poiché la v1 è deprecata per molti mercati.
+* **`mix` (o `spot`)**: Identifica il tipo di mercato.
+* `spot` = Mercato classico (compri e vendi l'asset reale).
+* `mix` = Il termine interno di Bitget per i **Derivati / Futures / Perpetual Contracts**. Visto che stai costruendo un bot di trading quantitativo, `mix` è quasi certamente il tuo target principale.
+
+
+* **`market_api` (o `account_api` / `order_api`)**: Identifica il dominio funzionale:
+* `market_api`: Dati pubblici (candele, orderbook, ticker). **Non** richiedono API key.
+* `account_api`: Dati privati del conto (saldi, margini). Richiedono autenticazione.
+* `order_api`: Esecuzione ordini (compra, vendi, stop loss). Richiedono autenticazione.
+
+
+
+---
+
+## Come mappare i parametri (La Regola dell'Involucro)
+
+Dato che l'SDK accetta solo un dizionario `params`, devi guardare la documentazione web ufficiale di Bitget e copiare le chiavi dei parametri *esattamente* come sono scritte lì (rispettando il camelCase).
+
+Per l'endpoint `candles` del mercato `v2/mix` (Futures), l'API si aspetta queste tre chiavi fondamentali:
+
+1. **`symbol`**: Il ticker dello strumento (es. `BTCUSDT`).
+2. **`granularity`**: Il timeframe (es. `1m`, `5m`, `1h`, `1D`).
+3. **`productType`**: Questo è il parametro cruciale che spesso ci si dimentica nei contratti. Indica il tipo di margine. Per i futures standard regolati in USDT devi passare **`usdt-futures`** (nella V1 si chiamava `umcbl`).
+
+### Il codice d'esempio pulito per il tuo Warm-up:
+
+```python
+from bitget.v2.mix.market_api import MarketApi
+
+# 1. Istanzie l'API (senza chiavi, sono dati pubblici)
+market_client = MarketApi()
+
+# 2. Costruisci il dizionario esattamente come richiesto dalle specifiche V2 Mix
+params = {
+    "symbol": "BTCUSDT",
+    "granularity": "1h",
+    "productType": "usdt-futures"  # <-- Cruciale per non ricevere errori dall'exchange
+}
+
+# 3. Esegui la chiamata passandogli il dizionario
+response = market_client.candles(params)
+
+# 4. Bitget risponde SEMPRE con una struttura sSStandard standardizzata
+if response.get("code") == "00000":  # "00000" nella codifica Bitget significa "Successo"
+    raw_candles = response.get("data", [])
+    # Ora hai una lista di liste: [timestamp, open, high, low, close, volume]
+else:
+    raise Exception(f"Errore API Bitget: {response.get('msg')}")
+
+```
+
+---
+
+## E per il WebSocket live?
+
+Il modulo `BitgetWsClient` ragiona con la stessa logica "raw". Non ha metodi del tipo `subscribe_to_btc()`. Devi mandargli un dizionario di configurazione (chiamato *payload*) per dirgli cosa ascoltare.
+
+La struttura V2 per connettersi e ascoltare le candele live in tempo reale è questa:
+
+```python
+# Struttura del messaggio di sottoscrizione da inviare al socket
+subscribe_message = {
+    "op": "subscribe",
+    "args": [
+        {
+            "instType": "USDT-FUTURES",
+            "channel": "candle1h",  # Il canale fonde la parola 'candle' col timeframe
+            "instId": "BTCUSDT"
+        }
+    ]
+}
+
+# Invio sul client WebSocket già inizializzato
+ws_client.send(subscribe_message)
+
+```
+---
+Ecco le istruzioni pronte da incollare direttamente su `notes.md` con i diversi metodi per ispezionare Redis in ambiente Docker.
+
+---
+
+# Guida all'Ispezione di Redis in Docker
+
+### Metodo 1: `docker exec` Interattivo (Consigliato)
+
+Accedi direttamente alla CLI di Redis dentro il container Docker in esecuzione.
+
+**1. Shell interattiva su DB 15:**
+
+```bash
+docker exec -it <nome_container_redis> redis-cli -n 15
+
+```
+
+**2. Esecuzione di comandi diretti in riga singola (senza entrare nella shell):**
+
+```bash
+# Leggi l'Hash della candela live
+docker exec -it <nome_container_redis> redis-cli -n 15 HGETALL candle:SPOT:BTCUSDT:1m:live
+
+# Leggi gli ultimi 3 elementi dello Stream delle candele chiuse
+docker exec -it <nome_container_redis> redis-cli -n 15 XREVRANGE candle:SPOT:BTCUSDT:1m:stream + - COUNT 3
+
+```
+
+---
+
+### Metodo 2: Container Temporaneo (Se Redis non espone le porte all'host)
+
+Utile se Redis è in una rete Docker privata e non hai `redis-cli` installato sull'host.
+
+```bash
+docker run --rm -it --network <nome_rete_docker> redis:alpine redis-cli -h <nome_service_redis> -p 6379 -n 15
+
+```
+
+---
+
+### Metodo 3: Da Host Locale (Se la porta 6379 è mappata `6379:6379`)
+
+Se nel `docker-compose.yml` hai configurato `ports: - "6379:6379"` e hai `redis-cli` installato sulla tua macchina.
+
+```bash
+redis-cli -h localhost -p 6379 -n 15
+
+```
+
+---
+
+### Metodo 4: Script Monoriga via Python (Dal Container App)
+
+Se vuoi ispezionare i dati esattamente dal punto di vista dell'applicazione Python.
+
+```bash
+docker exec -it <nome_container_app> python -c "import redis, os; r = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'), port=6379, db=15); print(r.hgetall('candle:SPOT:BTCUSDT:1m:live'))"
+
+```
+
+---
+
+### Cheatsheet Comandi Utili da Eseguire in `redis-cli`
+
+**1. Verifica Chiavi e Tipo Dati:**
+
+```redis
+# Elenca tutte le chiavi presenti nel DB 15
+KEYS candle:*
+
+# Controlla il tipo di struttura (hash o stream)
+TYPE candle:SPOT:BTCUSDT:1m:live
+TYPE candle:SPOT:BTCUSDT:1m:stream
+
+```
+
+**2. Ispezione Candela Live (Hash):**
+
+```redis
+# Mostra tutti i campi della candela in costruzione
+HGETALL candle:SPOT:BTCUSDT:1m:live
+
+# Estrai solo specifici campi
+HMGET candle:SPOT:BTCUSDT:1m:live close volume_quote timestamp
+
+```
+
+**3. Ispezione Candele Chiuse (Stream):**
+
+```redis
+# Conta quante candele chiuse sono attualmente salvate
+XLEN candle:SPOT:BTCUSDT:1m:stream
+
+# Leggi le ultime N candele salvate (dalla più recente alla più vecchia)
+XREVRANGE candle:SPOT:BTCUSDT:1m:stream + - COUNT 5
+
+# Leggi le prime N candele salvate (dalla più vecchia alla più recente)
+XRANGE candle:SPOT:BTCUSDT:1m:stream - + COUNT 5
+
+```
+
+**4. Debugging in Tempo Reale (Monitor):**
+
+```redis
+# Traccia OGNI operazione in arrivo su Redis in tempo reale (attenzione in prod: impatta le performance)
+MONITOR
+
+```
+
+L'idea di documentare ogni modulo è ottima per la manutenibilità, ma scrivere e aggiornare manualmente ogni singola funzione in file Markdown separati è un'anti-pattern che porta rapidamente al **documentation drift** (la documentazione diventa obsoleta non appena rifattorizzi il codice).
+
+In ambito DevOps e modern software engineering la pratica standard è il paradigma **Docs-as-Code**:
+
+* **Docstrings nel codice (API Reference):** Le singole funzioni, classi e parametri vanno documentati *esclusivamente* all'interno del codice Python usando un formato standard (come *Google Style* o *NumPy*). Il codice resta la singola fonte di verità.
+* **Architettura e Guide in `docs/`:** La cartella `docs/` deve contenere la visione d'insieme, l'architettura di sistema, le guide operative e i flussi di dati.
+* **Generazione Automatica via CI/CD:** Si usa un generatore di documentazione che legge automaticamente le docstring Python e compila un sito statico o file Markdown sempre aggiornati.
+
+---
+
+**Struttura raccomandata per `docs/**`
+
+```text
+docs/
+├── index.md                 # Panoramica del progetto, obiettivi e prerequisiti
+├── architecture/
+│   ├── overview.md          # Architettura high-level (Docker, Redis, Moduli)
+│   └── data_flow.md         # Flussi dati (es. gestione websocket, retry logic)
+├── guides/
+│   ├── setup.md             # Guida per ambiente di sviluppo e devcontainer
+│   └── configuration.md     # Spiegazione variabili .env e file di configurazione
+├── adr/                     # Architectural Decision Records (scelte chiave di design)
+│   └── 0001-async-client.md # Es. perché aiohttp invece di requests/httpx
+└── api/                     # Pagine segnaposto per la generazione automatica API
+
+```
+
+---
+
+**Lo stack DevOps ideale per Python**
+
+* **MkDocs + `mkdocstrings**`: È lo standard moderno per Python. Con pochissima configurazione legge il codice della tua app e genera automaticamente la documentazione delle funzioni e delle classi formattata in Markdown/HTML.
+* **Linting delle docstrings**: Integrazione nel flusso di test o pre-commit (`interrogate` o `flake8-docstrings`) per fallire la build se aggiungi una funzione pubblica senza docstring.
+* **Deploy automatico**: Tramite GitHub Actions / GitLab CI compili la documentazione a ogni merge su `main` e la pubblichi (es. su GitHub Pages).
+
+Mantenendo l'API Reference dentro le docstring Python (come hai già fatto impeccabilmente per `AsyncHttpClient`), in `docs/` ti basterà spiegare il *perché* e il *come si collegano i pezzi*, lasciando l'automazione a gestire il *cosa fa ogni funzione*.
