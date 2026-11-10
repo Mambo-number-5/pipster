@@ -3,7 +3,7 @@ import unittest
 import redis.asyncio as redis
 from typing import cast
 from core.base_ingestion import BaseIngestionWorker
-from core.token_bucket import RedisTokenBucket
+from core.rate_limiter import RedisTokenBucket
 from core.models import Candle
 from core.utils import retry_async
 
