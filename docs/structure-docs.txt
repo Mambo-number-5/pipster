@@ -1,0 +1,19 @@
+docs/
+├── index.md                      # Homepage della documentazione
+├── architecture/
+│   ├── overview.md               # Diagramma componenti + flusso dati
+│   ├── data-flow.md              # WS → worker → Redis → downstream
+│   └── decisions/                # ADR
+│       ├── 0001-adr-template.md
+│       ├── 0002-sliding-window-atomica.md
+│       ├── 0003-composizione-vs-ereditarieta-ws.md
+│       └── 0004-backpressure-worker.md
+├── guides/
+│   ├── getting-started.md        # Setup + avvio rapido
+│   ├── ingestion.md              # Warm-up, gap filling, riconciliazione
+│   ├── rate-limiting.md          # Spiegazione RateLimitManager
+│   └── deployment.md             # Docker, env, secret
+├── reference/
+│   ├── api/                      # Generato da Sphinx/MkDocs
+│   └── configuration.md          # Variabili env, file YAML
+└── roadmap.md                    # Fasi A-D + opzionali
