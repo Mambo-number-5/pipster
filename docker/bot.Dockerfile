@@ -11,6 +11,12 @@ RUN apt-get update && apt-get install -y \
 # 2. Solo ora dichiariamo le variabili di ambiente utili per l'installazione delle librerie di 'pip'.
 ENV PIP_ROOT_USER_ACTION=ignore
 
+# CREAZIONE UTENTE (Risolve il riavvio lento di devcontainer)
+# Creiamo il gruppo e l'utente 'pipster' associandogli l'UID 1000. 
+# Il parametro -m crea la sua cartella home in /home/pipster
+RUN groupadd -g 1000 pipster && \
+    useradd -u 1000 -g pipster -m -s /bin/bash pipster
+
 WORKDIR /app
 
 # 3. Copia dipendenze Python

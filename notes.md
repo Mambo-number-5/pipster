@@ -721,3 +721,40 @@ XRANGE candle:SPOT:BTCUSDT:1m:stream - + COUNT 5
 MONITOR
 
 ```
+
+L'idea di documentare ogni modulo è ottima per la manutenibilità, ma scrivere e aggiornare manualmente ogni singola funzione in file Markdown separati è un'anti-pattern che porta rapidamente al **documentation drift** (la documentazione diventa obsoleta non appena rifattorizzi il codice).
+
+In ambito DevOps e modern software engineering la pratica standard è il paradigma **Docs-as-Code**:
+
+* **Docstrings nel codice (API Reference):** Le singole funzioni, classi e parametri vanno documentati *esclusivamente* all'interno del codice Python usando un formato standard (come *Google Style* o *NumPy*). Il codice resta la singola fonte di verità.
+* **Architettura e Guide in `docs/`:** La cartella `docs/` deve contenere la visione d'insieme, l'architettura di sistema, le guide operative e i flussi di dati.
+* **Generazione Automatica via CI/CD:** Si usa un generatore di documentazione che legge automaticamente le docstring Python e compila un sito statico o file Markdown sempre aggiornati.
+
+---
+
+**Struttura raccomandata per `docs/**`
+
+```text
+docs/
+├── index.md                 # Panoramica del progetto, obiettivi e prerequisiti
+├── architecture/
+│   ├── overview.md          # Architettura high-level (Docker, Redis, Moduli)
+│   └── data_flow.md         # Flussi dati (es. gestione websocket, retry logic)
+├── guides/
+│   ├── setup.md             # Guida per ambiente di sviluppo e devcontainer
+│   └── configuration.md     # Spiegazione variabili .env e file di configurazione
+├── adr/                     # Architectural Decision Records (scelte chiave di design)
+│   └── 0001-async-client.md # Es. perché aiohttp invece di requests/httpx
+└── api/                     # Pagine segnaposto per la generazione automatica API
+
+```
+
+---
+
+**Lo stack DevOps ideale per Python**
+
+* **MkDocs + `mkdocstrings**`: È lo standard moderno per Python. Con pochissima configurazione legge il codice della tua app e genera automaticamente la documentazione delle funzioni e delle classi formattata in Markdown/HTML.
+* **Linting delle docstrings**: Integrazione nel flusso di test o pre-commit (`interrogate` o `flake8-docstrings`) per fallire la build se aggiungi una funzione pubblica senza docstring.
+* **Deploy automatico**: Tramite GitHub Actions / GitLab CI compili la documentazione a ogni merge su `main` e la pubblichi (es. su GitHub Pages).
+
+Mantenendo l'API Reference dentro le docstring Python (come hai già fatto impeccabilmente per `AsyncHttpClient`), in `docs/` ti basterà spiegare il *perché* e il *come si collegano i pezzi*, lasciando l'automazione a gestire il *cosa fa ogni funzione*.

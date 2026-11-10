@@ -8,6 +8,8 @@
     // Diciamo a VS Code di entrare nel servizio "bot"
     "service": "bot",
     "workspaceFolder": "/app",
+    // NUOVO: Specifichiamo l'utente creato nel Dockerfile
+    "remoteUser": "pipster",
     // Questa parte silenzia il warning nel terminale di VS Code
     "containerEnv": {
         "PIP_ROOT_USER_ACTION": "ignore"
@@ -20,16 +22,17 @@
                 "ms-python.vscode-pylance", // Suggerimenti intelligenti (risolve le linee rosse)
                 "njpwerner.autodocstring", // Per documentare la statistica velocemente
                 "ms-azuretools.vscode-docker", // Gestione container da VS Code
-                "redhat.vscode-yaml" // Autocompletamento per i file .yml
+                "redhat.vscode-yaml", // Autocompletamento per i file .yml
+                "esbenp.prettier-vscode", // Formattazione del codice
+                "continue.continue" // Chat AI integrata (Sostituto del browser per Qwen e Gemini)
             ],
             "settings": {
                 // Usa il Python del container, dove CCXT e Redis sono già installati
                 "python.defaultInterpreterPath": "/usr/local/bin/python",
                 "python.analysis.typeCheckingMode": "basic",
-                "editor.formatOnSave": true
+                "editor.formatOnSave": true,
+                "extensions.ignoreRecommendations": true // Evita installazioni automatiche non desiderate
             }
         }
     }
-    // "remoteUser": "root" rimosso. 
-    // Ora VS Code userà l'utente 1000:1000 passato dall'override e installerà l'estensione server in /tmp
 }
