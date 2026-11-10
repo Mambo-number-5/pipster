@@ -7,6 +7,7 @@ docker-compose.override.yml # Non carico il servizio dove si ferma in modalità 
 # Configurazione Editor
 .vscode/
 .idea/
+.vscode-server/
 
 # Python e Dipendenze
 __pycache__/
